@@ -1189,11 +1189,13 @@ impl Connection {
     }
 
     pub fn diagnostics(&self) -> ConnectionDiagnostics {
+        // 两个时长取同一个「现在」，否则数据刚连上就到时，静默时长可能比连接时长还长。
+        let now = Instant::now();
         ConnectionDiagnostics {
             http_status: self.http_status,
             received_bytes: self.received_bytes,
-            connected_for: self.started_at.elapsed(),
-            silent_for: self.last_chunk_at.elapsed(),
+            connected_for: now - self.started_at,
+            silent_for: now - self.last_chunk_at,
             stall_timeout: self.stall_timeout,
             buffered: self.buffer.len(),
             edge: self.edge,
@@ -1276,6 +1278,8 @@ mod tests {
     use tracing_subscriber::Layer;
     use tracing_subscriber::layer::SubscriberExt;
 
+    // 用 set_default 装上后要紧跟 rebuild_interest_cache：callsite 的 interest 是全局缓存，并行的测试
+    // 可能在本线程订阅者登记前就把它算成不发，事件就收不到了。
     #[derive(Clone, Default)]
     struct Captured(Arc<Mutex<Vec<BTreeMap<String, String>>>>);
 
@@ -1564,6 +1568,7 @@ mod tests {
             let _guard = tracing::subscriber::set_default(
                 tracing_subscriber::registry().with(captured.clone()),
             );
+            tracing::callsite::rebuild_interest_cache();
             let bytes = splittable_flv(2, 32);
             let response = if reset {
                 let chunks = futures::stream::iter([
@@ -1616,6 +1621,7 @@ mod tests {
             let _guard = tracing::subscriber::set_default(
                 tracing_subscriber::registry().with(captured.clone()),
             );
+            tracing::callsite::rebuild_interest_cache();
             let mut bytes = splittable_flv(0, 0);
             for index in 0..3u32 {
                 let mut frame = vec![0x17, 1, 0, 0, 0];
@@ -1675,6 +1681,7 @@ mod tests {
         let captured = Captured::default();
         let _guard =
             tracing::subscriber::set_default(tracing_subscriber::registry().with(captured.clone()));
+        tracing::callsite::rebuild_interest_cache();
 
         let mut connection = Connection::new(complete_response(splittable_flv(6, 2_000)));
         // The caller consumes the 9 byte FLV header before handing the stream to the parser.
@@ -1809,6 +1816,7 @@ mod tests {
         const LIVE0: i64 = 1_792_908_000_000;
         let captured = Captured::default();
         let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(captured.clone()));
+        tracing::callsite::rebuild_interest_cache();
         let mut bytes = vec![b'F', b'L', b'V', 1, 5, 0, 0, 0, 9, 0, 0, 0, 0];
         append_tag(&mut bytes, 9, &[0x17, 0x00, 0, 0, 0, 0x01, 0x64, 0x00], 0);
         for index in 0..5u32 {
@@ -2083,6 +2091,7 @@ mod tests {
         let captured = Captured::default();
         let _guard =
             tracing::subscriber::set_default(tracing_subscriber::registry().with(captured.clone()));
+        tracing::callsite::rebuild_interest_cache();
 
         let mut connection = Connection::new(complete_response(
             flv_with_absolute_base_and_zero_keyframes(10, 4_000),
@@ -2542,6 +2551,7 @@ mod tests {
         let captured = Captured::default();
         let _guard =
             tracing::subscriber::set_default(tracing_subscriber::registry().with(captured.clone()));
+        tracing::callsite::rebuild_interest_cache();
 
         let mut connection = Connection::new(complete_response(flv_with_a_mid_stream_base_change(
             10, 4_000,
