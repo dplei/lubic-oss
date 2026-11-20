@@ -11,7 +11,7 @@
   <img alt="License" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue">
 </p>
 
-lubic 从 [biliup](https://github.com/biliup/biliup) 提炼而来，目标是一个**最小、稳定**的录制器：轮询开播 → 录制 HTTP-FLV / HLS → 按时长或大小切段 → 断流自动重连 → 下播宽限期满回到轮询。在此之上，它把录制、上传、投稿拆成「总控 + 多台 Agent」：一台机器录不好（CDN 限速、断流、磁盘满、上行被占），总控把房间换到另一台，计划内的交接会让两台重叠录一段以减少缺段；各台录的分段最后集中投成一份稿件。
+lubic 的起点是一个**最小、稳定**的录制器：轮询开播 → 录制 HTTP-FLV / HLS → 按时长或大小切段 → 断流自动重连 → 下播宽限期满回到轮询。在此之上，它把录制、上传、投稿拆成「总控 + 多台 Agent」：一台机器录不好（CDN 限速、断流、磁盘满、上行被占），总控把房间换到另一台，计划内的交接会让两台重叠录一段以减少缺段；各台录的分段最后集中投成一份稿件。
 
 > 这是作者自用项目的公开快照，用来分享技术栈与设计思路。源码与自用版同步，作者自己的部署脚本与基础设施不包含在内；仓库 CI 会构建 Docker 镜像，不另发版本。
 
@@ -208,7 +208,7 @@ cargo test --workspace
 
 ## 致谢
 
-- [biliup](https://github.com/biliup/biliup)：录制与上传的思路来源。
+- [biliup](https://github.com/biliup/biliup)：录制部分的 FLV 解析、HTTP-FLV / HLS 拉流与 B 站、抖音开播检测最初源自 biliup（MIT），版权声明见 [THIRD-PARTY-NOTICES](THIRD-PARTY-NOTICES)。
 
 ## 许可证
 
