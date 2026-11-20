@@ -1,0 +1,1606 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>lubic 控制台</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<style>
+/* 控制台单页：样张见 docs/design/console-mock.html，单色灰阶，状态靠字重与圆点；数据走 /api/* 每 5 秒轮询。 */
+:root {
+  --font-sans: 'Inter', ui-sans-serif, system-ui, -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  --font-mono: ui-monospace, 'SFMono-Regular', Menlo, monospace;
+  --bg: #ffffff;
+  --surface: #fafafa;
+  --chip: #f5f5f5;
+  --border: #e5e5e5;
+  --underline: #d4d4d4;
+  --faint: #a3a3a3;
+  --muted: #737373;
+  --text: #525252;
+  --strong: #171717;
+  --flash: #f0f0f0;
+  --dot: rgba(0,0,0,.11);
+  /* 全页唯一的颜色：分段刻度里的空段与丢失，小格子只靠形状分不清 */
+  --warn: #c9a46a; --bad: #cc8a8a;
+  --ease: 200ms;
+  --sun: block; --moon: none;
+  --page-bg: radial-gradient(var(--dot) 1px, transparent 1.2px) 0 0 / 14px 14px fixed, var(--bg);
+  --spring: cubic-bezier(.16,1,.3,1);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0a0a0a; --surface: rgba(23,23,23,.6); --chip: #262626; --border: #262626; --underline: #404040;
+    --faint: #737373; --muted: #a3a3a3; --text: #a3a3a3; --strong: #ffffff; --flash: #1f1f1f; --dot: rgba(255,255,255,.08); --sun: none; --moon: block; --warn: #a88a5c; --bad: #ad6f6f;
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0a0a0a; --surface: rgba(23,23,23,.6); --chip: #262626; --border: #262626; --underline: #404040;
+  --faint: #737373; --muted: #a3a3a3; --text: #a3a3a3; --strong: #ffffff; --flash: #1f1f1f; --dot: rgba(255,255,255,.08); --sun: none; --moon: block; --warn: #a88a5c; --bad: #ad6f6f;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; margin: 0; }
+[hidden] { display: none !important; }
+/* 点阵：参考 antfu.me，整页均匀铺满、不淡出；固定在视口上，滚动时不动 */
+html { overflow-x: clip; scrollbar-gutter: stable; }
+body { background: var(--page-bg); color: var(--text); font: 14px/1.5 var(--font-sans); -webkit-font-smoothing: antialiased; }
+a, button, input, textarea { color: inherit; font: inherit; }
+button { background: none; border: 0; padding: 0; cursor: pointer; }
+a, button, .row, .field-box { transition: color var(--ease), background-color var(--ease), border-color var(--ease); }
+:focus-visible { outline: 2px solid var(--strong); outline-offset: 3px; border-radius: 4px; }
+ul { list-style: none; padding: 0; }
+.mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+
+.wrap { max-width: 64rem; margin: 0 auto; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+@media (min-width: 640px) { .wrap { padding-left: max(24px, env(safe-area-inset-left, 0px)); padding-right: max(24px, env(safe-area-inset-right, 0px)); } }
+
+/* 顶栏吸顶：底色始终不透明（内容不会从下面透出来），底色用阴影横向铺满整宽；离开顶部后才出现底线 */
+nav { position: sticky; top: env(safe-area-inset-top, 0px); z-index: 20; display: flex; justify-content: space-between; align-items: center; padding-block: 1rem;
+  /* 全出血：横向铺满视口，padding 正好抵掉负 margin，内容与正文同一条边（页边距已在 .wrap 里）；背景与 body 同一张固定点阵 */
+  margin-inline: calc(50% - 50vw); padding-inline: calc(50vw - 50%);
+  background: var(--page-bg); border-bottom: 1px solid transparent; transition: border-color var(--ease); }
+nav.stuck { border-bottom-color: var(--border); }
+#nav-sentinel { height: 1px; margin-bottom: -1px; }
+body::after { content: ""; position: fixed; inset: 0 0 auto; height: env(safe-area-inset-top, 0px); z-index: 21; background: var(--bg); }
+.logo { display: inline-flex; align-items: center; gap: .5rem; color: var(--strong); font-weight: 600; text-decoration: none; letter-spacing: -.01em; }
+.logo svg { width: 28px; height: 28px; flex: none; }
+/* 图的白色身体在下半部，视觉重心偏低；字按几何居中会显得偏上 */
+.logo span { position: relative; top: 2px; }
+/* Logo 上摄影机的红灯：有房间在录才闪，亮暗硬切像 REC 灯 */
+@keyframes rec { 50% { opacity: .15; } }
+.recording #rec { animation: rec 1.6s steps(1) infinite; }
+.links { display: flex; gap: 1.25rem; align-items: center; }
+.links a { color: var(--muted); text-decoration: none; }
+.links a:hover, .links a[aria-current] { color: var(--strong); }
+.links a { position: relative; }
+.links a[aria-current]::after { content: ""; position: absolute; left: 50%; bottom: -8px; width: 4px; height: 4px; margin-left: -2px; border-radius: 50%; background: var(--strong); animation: pop .45s var(--spring); }
+.links .alert { position: absolute; top: -1px; right: -7px; width: 5px; height: 5px; border-radius: 50%; background: var(--strong); }
+@keyframes pop { from { transform: scale(0); } }
+
+/* 心跳：每次轮询回来闪一下；超过 15 秒没更新变空心并显示「连接中断」 */
+.beat { position: relative; display: inline-flex; align-items: center; padding: .375rem; margin: -.375rem; color: var(--muted); font-size: .75rem; }
+.beat .dot { width: 6px; height: 6px; }
+.beat .dot.on { background: var(--muted); border-color: var(--muted); }
+.beat.tick .dot { animation: beat .7s var(--spring); }
+@keyframes beat { 0% { transform: scale(1); background: var(--strong); border-color: var(--strong); } 30% { transform: scale(1.9); } }
+/* 悬停浮窗：绝对定位在圆点下方，右端对齐，不占布局 */
+.beat .beat-text { position: absolute; top: calc(100% + 8px); right: -2px; white-space: nowrap; padding: .25rem .5rem; border: 1px solid var(--border); border-radius: .375rem; background: var(--bg); color: var(--text);
+  opacity: 0; transform: translateY(-4px); pointer-events: none; transition: opacity .2s, transform .3s var(--spring); }
+.beat:hover .beat-text, .beat:focus-visible .beat-text { opacity: 1; transform: none; }
+/* 触屏点按看细节：带 title/data-tip 的元素点一下，贴近它弹出浮窗；点别处、Esc 或滚动就收起 */
+#tip { position: fixed; inset: auto; margin: 0; max-width: min(22rem, calc(100vw - 32px)); max-height: 50vh; overflow: auto; white-space: pre-line;
+  padding: .375rem .625rem; border: 1px solid var(--border); border-radius: .375rem; background: var(--bg); color: var(--text); font-size: .75rem; line-height: 1.6; }
+@media (hover: none) { [data-tip], .why[title] { cursor: pointer; } .beat .beat-text { display: none; } }
+/* 断线横幅：贴在顶栏底线下方，随顶栏吸顶，横向铺满 */
+.lost-bar { position: absolute; left: 0; right: 0; top: 100%; padding: .375rem 1rem; text-align: center; font-size: .75rem; font-weight: 600; color: var(--strong); background: var(--chip); border-bottom: 1px solid var(--border); animation: drop .35s var(--spring); }
+.lost-bar .why { font-weight: 400; color: var(--muted); }
+@keyframes drop { from { opacity: 0; transform: translateY(-6px); } }
+
+/* 切页：各块错开上浮淡入 */
+[data-view] > * { animation: rise .6s var(--spring) both; }
+[data-view] > :nth-child(2) { animation-delay: 70ms; }
+[data-view] > :nth-child(3) { animation-delay: 140ms; }
+@keyframes rise { from { opacity: 0; transform: translateY(12px); } }
+.icon-btn { color: var(--muted); display: inline-flex; }
+.icon-btn:hover { color: var(--strong); }
+.icon-btn svg { width: 18px; height: 18px; }
+.i-sun { display: var(--sun); } .i-moon { display: var(--moon); }
+
+main { padding-block: 2.5rem 4rem; display: grid; gap: 3.5rem; }
+@media (min-width: 640px) { main { padding-block: 3.5rem 5rem; } }
+
+.head { display: flex; align-items: flex-end; justify-content: space-between; gap: 1rem; flex-wrap: wrap; border-bottom: 1px solid var(--border); padding-bottom: .875rem; }
+.label { color: var(--strong); font-size: .8125rem; font-weight: 600; text-transform: uppercase; letter-spacing: .1em; }
+.desc { margin-top: .25rem; color: var(--muted); font-size: .8125rem; }
+.desc b { color: var(--strong); font-weight: 600; }
+h1 { color: var(--strong); font-size: 1.5rem; font-weight: 600; letter-spacing: -.025em; text-wrap: balance; }
+
+.btn { display: inline-flex; align-items: center; gap: .375rem; border: 1px solid transparent; border-radius: .5rem; text-decoration: none; background: var(--strong); color: var(--bg); padding: .4375rem .875rem; font-weight: 500; font-size: .8125rem; }
+.btn:hover { opacity: .85; }
+#t-save:disabled { opacity: .5; cursor: not-allowed; }
+.btn-ghost { text-decoration: none; border-radius: .5rem; padding: .4375rem .875rem; font-size: .8125rem; color: var(--muted); border: 1px solid transparent; }
+.btn-ghost:hover { color: var(--strong); border-color: var(--border); }
+/* 字贴齐两侧的边：抵掉内边距与透明边框（区块标题旁换行后靠左，不换行靠右） */
+.head .btn-ghost { margin-inline: calc(-.875rem - 1px); }
+.danger { font-size: .8125rem; color: var(--muted); padding: .4375rem .25rem; }
+.danger:hover { color: var(--strong); text-decoration: underline; text-underline-offset: 4px; }
+.spacer + .danger, footer .danger, .lrow .r .danger:last-child { margin-right: -.25rem; }
+.danger.arm { color: var(--strong); font-weight: 600; text-decoration: underline; text-underline-offset: 4px; }
+
+/* 状态圆点：在录 = 实心深色，空闲 = 空心浅色，离线 = 虚线 */
+.dot { width: 7px; height: 7px; border-radius: 50%; border: 1.5px solid var(--faint); flex: none; }
+.dot.on { background: var(--strong); border-color: var(--strong); }
+.dot.off { border-style: dashed; }
+.dot.on.pulse { animation: pulse 2.4s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: .35; } }
+
+/* 房间行 */
+.rows > li:not(:last-child) { border-bottom: 1px solid var(--border); }
+.row { display: grid; grid-template-columns: 7px minmax(0, 9rem) minmax(0, 1fr) 9rem 13rem; gap: .25rem 1rem; align-items: center; width: 100%; text-align: left; padding: .625rem .5rem; margin-inline: -.5rem; width: calc(100% + 1rem); border-radius: .5rem; }
+.row:hover { background: var(--surface); }
+.row[aria-expanded="true"] { background: var(--surface); }
+.row[aria-expanded="true"] .name { color: var(--strong); font-weight: 600; }
+.row .name { display: flex; align-items: baseline; min-width: 0; color: var(--muted); white-space: nowrap; }
+.row .name .n { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.row .name small { color: var(--faint); font-size: .75rem; margin-left: .375rem; flex: none; }
+.row.live .name { color: var(--strong); font-weight: 500; }
+.row .title { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.row .title .note { color: var(--strong); font-weight: 600; margin-left: .5rem; }
+.row .where { color: var(--faint); font-size: .75rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.row.live .where { color: var(--text); }
+/* 定宽，各行的机器列才对齐；分P多到放不下时裁掉最早的刻度 */
+.row .dur { display: flex; justify-content: flex-end; align-items: center; gap: .625rem; font-size: .75rem; color: var(--faint); overflow: hidden; }
+.row .dur > * { flex: none; }
+.row .last-live { display: inline-flex; flex-wrap: wrap; justify-content: flex-end; column-gap: .25rem; flex-shrink: 1; min-width: 0; text-align: right; }
+.row.live .dur { color: var(--strong); }
+/* 分段刻度：每个分P一格；实心已传，半实心在传，空心待传，闪烁在录，琥珀斜线空段，红色交叉丢失 */
+.ticks { display: inline-flex; gap: 2px; }
+.ticks i { width: 8px; height: 8px; border-radius: 2px; background: var(--text); }
+.ticks i.up { opacity: .45; }
+.ticks i.q { background: none; box-shadow: inset 0 0 0 1px var(--faint); }
+/* 在传：按进度从下往上填 */
+.ticks i.ing { background: linear-gradient(to top, var(--text) calc(var(--p, .5) * 100%), transparent 0); box-shadow: inset 0 0 0 1px var(--text); opacity: .7; }
+.ticks i.void { --c: var(--warn); } .ticks i.lost { --c: var(--bad); }
+.ticks i.void, .ticks i.lost { --slash: transparent calc(50% - .75px), var(--c) 0 calc(50% + .75px), transparent 0; box-shadow: inset 0 0 0 1px var(--c); }
+.ticks i.void { background: linear-gradient(to top right, var(--slash)); }
+.ticks i.lost { background: linear-gradient(to top right, var(--slash)), linear-gradient(to bottom right, var(--slash)); }
+.ticks i.rec { background: var(--strong); animation: pulse 1.6s ease-in-out infinite; }
+.legend { display: inline-flex; gap: .75rem; margin-left: .75rem; color: var(--faint); }
+.legend span { display: inline-flex; align-items: center; gap: .3125rem; }
+.row.saved .dur > * { display: none; }
+.row.saved .dur::before { content: "已保存"; color: var(--strong); animation: rise .4s var(--spring); }
+.flash { animation: flash 1.2s ease-out; }
+@keyframes flash { from { background: var(--flash); } }
+@media (max-width: 639px) {
+  .row { grid-template-columns: 7px minmax(0, 1fr) auto; grid-template-areas: "d n t" ". s w"; }
+  .row .dot { grid-area: d; } .row .name { grid-area: n; } .row .dur { grid-area: t; }
+  .ticks i:nth-last-child(n+7) { display: none; } .legend { display: none; }
+  .row .title { grid-area: s; font-size: .8125rem; } .row .where { grid-area: w; text-align: right; }
+  .row.idle .title { display: none; } .row.idle .where { grid-area: s; text-align: left; }
+}
+
+/* 行内表单 */
+/* 展开的表单：左缘对齐房间名那一列，外轮廓圈住，归属一眼可见 */
+.editor { margin: .25rem 0 1rem calc(7px + 1rem); padding: 1.25rem; border: 1px solid var(--border); border-radius: .75rem; background: var(--bg); display: grid; gap: 1.25rem; }
+@media (max-width: 639px) { .editor { margin-left: .75rem; padding: 1rem; } }
+.grid2 { display: grid; gap: 1rem 1.5rem; grid-template-columns: 1fr; }
+@media (min-width: 640px) { .grid2 { grid-template-columns: 1fr 1fr; } .span2 { grid-column: span 2; } }
+.field { display: grid; gap: .375rem; min-width: 0; align-content: start; }
+.field > label, .field > .flabel { font-size: .75rem; color: var(--muted); font-weight: 500; }
+.field .hint, .editor > .hint { font-size: .75rem; color: var(--faint); }
+.field-box { width: 100%; border: 1px solid var(--border); border-radius: .5rem; background: transparent; padding: .5rem .75rem; color: var(--strong); outline: none; }
+.field-box:hover { border-color: var(--underline); }
+.field-box:focus { border-color: var(--strong); }
+textarea.field-box { resize: vertical; min-height: 6rem; line-height: 1.6; }
+.inline { display: flex; gap: .5rem; align-items: center; }
+.unit { color: var(--faint); font-size: .8125rem; white-space: nowrap; }
+.form-foot { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; }
+.form-foot .spacer { flex: 1; }
+.err { font-size: .8125rem; color: var(--strong); font-weight: 600; }
+.err::before { content: "× "; }
+
+/* 自写下拉 */
+.select { position: relative; }
+.select > button { display: flex; justify-content: space-between; align-items: center; gap: .5rem; text-align: left; }
+.select > button::after { content: ""; width: 6px; height: 6px; border-right: 1.5px solid var(--faint); border-bottom: 1.5px solid var(--faint); transform: translateY(-2px) rotate(45deg); flex: none; }
+.select ul { position: absolute; z-index: 5; left: 0; right: 0; top: calc(100% + 4px); background: var(--bg); border: 1px solid var(--border); border-radius: .5rem; padding: .25rem; max-height: 15rem; overflow: auto; }
+.select li { padding: .4375rem .625rem; border-radius: .375rem; cursor: pointer; color: var(--text); }
+.select li:hover, .select li[aria-selected="true"] { background: var(--chip); color: var(--strong); }
+.select li small { color: var(--faint); margin-left: .375rem; }
+
+/* 分段选择、开关、机器标签 */
+.seg { display: inline-flex; justify-self: start; border: 1px solid var(--border); border-radius: .5rem; padding: 2px; flex: none; }
+.seg button { padding: .4375rem .75rem; border-radius: .375rem; color: var(--muted); font-size: .8125rem; }
+.seg button[aria-pressed="true"] { background: var(--chip); color: var(--strong); font-weight: 500; }
+.switch { display: inline-flex; align-items: center; gap: .625rem; color: var(--text); text-align: left; }
+.switch .track { width: 30px; height: 18px; border-radius: 99px; background: var(--border); position: relative; flex: none; transition: background-color var(--ease); }
+.switch .track::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: var(--bg); transition: transform var(--ease); }
+.switch[aria-checked="true"] .track { background: var(--strong); }
+.switch[aria-checked="true"] .track::after { transform: translateX(12px); }
+.chips { display: flex; flex-wrap: wrap; gap: .5rem; }
+.chip { display: inline-flex; align-items: center; gap: .375rem; border: 1px solid var(--border); border-radius: 99px; padding: .25rem .75rem .25rem .375rem; color: var(--muted); }
+.chip .n { width: 18px; height: 18px; border-radius: 50%; border: 1px dashed var(--underline); font: 600 .6875rem/16px var(--font-mono); text-align: center; color: var(--bg); }
+.chip:hover { border-color: var(--underline); color: var(--strong); }
+.chip.sel { color: var(--strong); border-color: var(--strong); font-weight: 500; }
+.chip.sel .n { background: var(--strong); border: 1px solid var(--strong); }
+.chip .st { font-size: .6875rem; color: var(--faint); font-weight: 400; }
+.tag { display: inline-flex; align-items: center; gap: .25rem; background: var(--chip); border-radius: 99px; padding: .1875rem .375rem .1875rem .625rem; font-size: .75rem; color: var(--text); }
+.tag.from-tpl { background: transparent; box-shadow: inset 0 0 0 1px var(--border); color: var(--muted); padding-right: .625rem; }
+.tag-count { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+.tag-count.over { color: var(--bad); }
+.tag button { color: var(--faint); width: 16px; height: 16px; border-radius: 50%; line-height: 1; }
+.tag button:hover { color: var(--strong); }
+.tags-box { display: flex; flex-wrap: wrap; gap: .375rem; align-items: center; padding-block: .375rem; }
+.tags-box input { border: 0; outline: none; background: transparent; flex: 1; min-width: 6rem; color: var(--strong); padding: .125rem 0; }
+
+/* 机器：列线与上面的房间表重合（名字列 9rem，磁盘列起点 = 房间表的机器列） */
+.mrow { display: grid; grid-template-columns: 7px 9rem minmax(0, 1fr) 12.5rem 9.5rem; gap: .25rem 1rem; align-items: center; width: 100%; text-align: left; padding: .75rem 0; }
+.mrow.disabled { opacity: .55; }
+.mrow .mname { color: var(--strong); font-weight: 500; overflow: hidden; text-overflow: ellipsis; }
+.mrow .mname small { color: var(--faint); font-size: .75rem; margin-left: .375rem; }
+.mrow .mname br + small { margin-left: 0; }
+.mrow.offline .mname { color: var(--muted); font-weight: 400; }
+.mrow .mrooms { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mrow .mrooms b { color: var(--strong); font-weight: 600; }
+.disk { display: flex; align-items: center; gap: .625rem; font-size: .75rem; color: var(--text); white-space: nowrap; }
+.bar { flex: none; width: 3rem; height: 4px; border-radius: 99px; background: var(--chip); overflow: hidden; }
+.bar i { display: block; height: 100%; background: var(--muted); }
+.bar.hot i { background: var(--strong); }
+.mrow .queue { text-align: right; white-space: nowrap; font-size: .75rem; color: var(--faint); }
+@media (max-width: 639px) {
+  .mrow { grid-template-columns: 7px minmax(0, 1fr) auto; grid-template-areas: "d n q" ". r r" ". k k"; }
+  .mrow .dot { grid-area: d; } .mrow .mname { grid-area: n; } .mrow .queue { grid-area: q; }
+  .mrow .mrooms { grid-area: r; font-size: .8125rem; } .mrow .disk { grid-area: k; }
+}
+
+/* 投稿 */
+.srow { display: grid; grid-template-columns: 7px minmax(0, 16rem) minmax(0, 1fr) 2.5rem 20rem; gap: .25rem 1rem; align-items: center; padding: .625rem 0; }
+.srow .sname { display: flex; align-items: baseline; min-width: 0; color: var(--strong); font-weight: 500; white-space: nowrap; }
+.srow .sname .n { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+/* 开播时刻优先：名字列从标题列借宽，再放不下截房间名 */
+.srow .sname small { color: var(--faint); font-size: .75rem; font-weight: 400; margin-left: .375rem; flex: none; }
+.srow .stitle { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.srow .sparts { color: var(--faint); font-size: .75rem; text-align: right; white-space: nowrap; }
+.srow .sstate { text-align: right; min-width: 0; font-size: .8125rem; color: var(--muted); }
+.srow .sstate b, .srow .sstate a { color: var(--strong); font-weight: 600; }
+.srow .sstate a { text-decoration: none; font-weight: 500; }
+.srow .sstate a:hover { text-decoration: underline; text-underline-offset: 4px; }
+.srow .sstate .danger { padding: 0; margin-left: .5rem; }
+.srow .sstate > div:first-child { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.srow .sstate .why { color: var(--faint); font-size: .75rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* 已投：分批展开，右侧按自然日的刻度（左今右旧） */
+.rows > li.rise { animation: rise .6s var(--spring) both; }
+.more { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 1rem; padding-top: .75rem; border-top: 1px solid var(--border); }
+.more:empty { display: none; }
+.more .btn-ghost { margin-left: -.875rem; }
+.more .why { color: var(--faint); font-size: .75rem; }
+.more .why a { color: var(--muted); text-decoration: underline; text-decoration-color: var(--border); text-underline-offset: 4px; }
+.more .why a:hover { color: var(--strong); text-decoration-color: currentColor; }
+.days { gap: 0; }
+.days button { padding: 3px 1px; border-radius: 3px; display: flex; }
+.days button[aria-disabled] { cursor: default; }
+.days i.none { background: none; box-shadow: none; outline: 1px dashed var(--faint); outline-offset: -1px; }
+.days button:not([aria-disabled]):hover i { box-shadow: inset 0 0 0 1px var(--strong); }
+@media (max-width: 639px) {
+  .srow { grid-template-columns: 7px minmax(0, 1fr) auto; grid-template-areas: "d n p" ". t t" ". s s"; }
+  .srow .dot { grid-area: d; } .srow .sname { grid-area: n; } .srow .sparts { grid-area: p; }
+  .srow .stitle { grid-area: t; font-size: .8125rem; } .srow .sstate { grid-area: s; text-align: left; }
+  .srow .sstate .why { white-space: normal; }
+}
+
+/* 列表通用（模板、账号） */
+.lrow { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: .125rem 1rem; align-items: center; padding: .75rem .5rem; margin-inline: -.5rem; border-radius: .5rem; text-decoration: none; }
+a.lrow:hover { background: var(--surface); }
+.lrow .t { color: var(--strong); font-weight: 500; }
+.lrow .s { grid-column: 1; font-size: .75rem; color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lrow .r { grid-row: 1 / span 2; grid-column: 2; font-size: .8125rem; color: var(--muted); text-align: right; }
+.lrow .r b { color: var(--strong); font-weight: 600; }
+
+/* 模板编辑 */
+.back { color: var(--muted); text-decoration: none; font-size: .8125rem; }
+.back:hover { color: var(--strong); }
+.tpl { display: grid; gap: 2rem; grid-template-columns: 1fr; }
+@media (min-width: 860px) { .tpl { grid-template-columns: minmax(0, 1fr) 20rem; } .tpl aside { position: sticky; top: 1.5rem; align-self: start; } }
+.cover { aspect-ratio: 1146 / 717; max-width: 100%; background: #000; color: #fff; border-radius: .5rem; border: 1px solid var(--border); display: grid; place-content: center; text-align: center; gap: .5rem; font-family: 'Source Han Sans SC', 'Noto Sans SC', 'PingFang SC', sans-serif; font-weight: 700; }
+.cover .c1 { font-size: 2.25rem; letter-spacing: .02em; }
+.cover .c2 { font-size: .9375rem; font-family: var(--font-mono); opacity: .9; }
+.cover-img { display: block; width: 18rem; max-width: 100%; aspect-ratio: 1146 / 717; border-radius: .5rem; border: 1px solid var(--border); background: #000; }
+.render { font-size: .75rem; color: var(--muted); }
+.render b { color: var(--strong); font-weight: 500; }
+.ph { display: inline-flex; gap: .375rem; flex-wrap: wrap; }
+.ph button { font: .75rem var(--font-mono); color: var(--muted); border: 1px solid var(--border); border-radius: 99px; padding: .0625rem .5rem; }
+.ph button:hover { color: var(--strong); border-color: var(--underline); }
+
+/* 扫码 */
+.qr-box { display: flex; gap: 1.5rem; align-items: center; padding: 1.25rem 0; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+.qr-box .qr { width: 148px; height: 148px; border-radius: .5rem; background: #fff; padding: 8px; border: 1px solid var(--border); image-rendering: pixelated; }
+.qr-box .state { color: var(--strong); font-weight: 500; }
+.qr-box .sub { margin-top: .25rem; font-size: .8125rem; color: var(--muted); max-width: 22rem; }
+.qr-box .acts { margin-top: .875rem; display: flex; gap: .5rem; }
+.qr-box .qr svg { display: block; width: 100%; height: 100%; }
+.qr-box.dim .qr { opacity: .25; }
+
+footer { position: relative; padding-block: 1.5rem 2.5rem; font-size: .75rem; color: var(--faint); display: flex; justify-content: space-between; gap: 1rem; flex-wrap: wrap; }
+#version { padding: .375rem; margin: -.375rem; user-select: none; -webkit-touch-callout: none; }
+#version a { text-decoration: none; text-underline-offset: 3px; }
+#version a:hover { color: var(--strong); text-decoration: underline dotted; }
+footer::before { content: ""; position: absolute; inset: 0 0 auto; height: 9px; color: var(--text); opacity: .3; pointer-events: none; border-bottom: 1px solid currentColor;
+  background: repeating-linear-gradient(90deg, currentColor 0 1px, transparent 1px 16px) left bottom / 100% 3px no-repeat,
+    repeating-linear-gradient(90deg, currentColor 0 1px, transparent 1px 80px) left bottom / 100% 8px no-repeat; }
+.empty { padding: 1.25rem 0; color: var(--faint); }
+.login { max-width: 22rem; display: grid; gap: 1.25rem; }
+body.out .in { display: none; }
+
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
+</style>
+</head>
+<body class="out">
+<div class="wrap">
+  <div id="nav-sentinel" aria-hidden="true"></div>
+  <nav>
+    <a class="logo" href="#overview">{{logo}}<span>lubic</span></a>
+    <div class="links">
+      <a href="#overview" data-nav="overview" class="in">总览</a>
+      <a href="#submits" data-nav="submits" class="in">投稿<span class="alert" hidden></span></a>
+      <a href="#templates" data-nav="templates" class="in">模板</a>
+      <a href="#accounts" data-nav="accounts" class="in">账号</a>
+      <button class="icon-btn" id="theme" type="button" aria-label="切换亮/暗色">
+        <svg class="i-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2.75v1.5M12 19.75v1.5M2.75 12h1.5M19.75 12h1.5M5.46 5.46l1.06 1.06M17.48 17.48l1.06 1.06M5.46 18.54l1.06-1.06M17.48 6.52l1.06-1.06"/></svg>
+        <svg class="i-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5Z"/></svg>
+      </button>
+      <button class="beat in" id="beat" type="button" aria-label="连接正常"><span class="dot on"></span><span class="beat-text mono" aria-hidden="true"></span></button>
+    </div>
+    <div class="lost-bar" id="lost-bar" role="status" hidden></div>
+    <div id="tip" role="tooltip" popover></div>
+  </nav>
+
+  <main data-view="login" hidden>
+    <form class="login" id="login-form">
+      <h1>登录控制台</h1>
+      <div class="field">
+        <label for="l-pw">管理员密码</label>
+        <input class="field-box" id="l-pw" type="password" autocomplete="current-password" autofocus>
+      </div>
+      <div class="form-foot">
+        <button class="btn" type="submit">登录</button>
+        <span class="err" id="l-err" hidden></span>
+      </div>
+    </form>
+  </main>
+
+  <main data-view="overview" hidden>
+    <section aria-labelledby="h-rooms">
+      <div class="head">
+        <div>
+          <h2 class="label" id="h-rooms">房间</h2>
+          <p class="desc" id="rooms-desc"></p>
+        </div>
+        <button class="btn" id="add-room" type="button">添加房间</button>
+      </div>
+      <ul class="rows" id="rooms"></ul>
+    </section>
+
+    <section aria-labelledby="h-machines">
+      <div class="head">
+        <div>
+          <h2 class="label" id="h-machines">机器</h2>
+          <p class="desc">硬盘到水位停录；新开播的房间分给在录最少的机器，一样多时按优先机器顺序。点一台机器管理它。</p>
+        </div>
+        <button class="btn-ghost" id="add-machine" type="button">新增机器</button>
+      </div>
+      <ul class="rows" id="machines"></ul>
+    </section>
+  </main>
+
+  <main data-view="submits" hidden>
+    <section aria-labelledby="h-sacc">
+      <div class="head">
+        <div>
+          <h2 class="label" id="h-sacc">投稿账号</h2>
+          <p class="desc">停投与投稿间隔按账号计算；总控重启后清零。</p>
+        </div>
+      </div>
+      <ul class="rows" id="s-accounts"></ul>
+    </section>
+
+    <section aria-labelledby="h-pending">
+      <div class="head">
+        <div>
+          <h2 class="label" id="h-pending">待投</h2>
+          <p class="desc" id="pending-desc"></p>
+        </div>
+      </div>
+      <ul class="rows" id="s-pending"></ul>
+    </section>
+
+    <section aria-labelledby="h-done">
+      <div class="head">
+        <div>
+          <h2 class="label" id="h-done">已投</h2>
+          <p class="desc" id="done-desc"></p>
+        </div>
+      </div>
+      <ul class="rows" id="s-done"></ul>
+      <div class="more" id="s-done-more"></div>
+    </section>
+  </main>
+
+  <main data-view="templates" hidden>
+    <section aria-labelledby="h-tpl">
+      <div class="head">
+        <div>
+          <h2 class="label" id="h-tpl">投稿模板</h2>
+          <p class="desc">多个房间可以共用一个模板；合集在房间里选。</p>
+        </div>
+        <a class="btn" href="#template/new">新建模板</a>
+      </div>
+      <ul id="templates"></ul>
+    </section>
+  </main>
+
+  <main data-view="template" hidden>
+    <div style="display:grid;gap:.75rem">
+      <a class="back" href="#templates">← 模板</a>
+      <h1 id="tpl-h1"></h1>
+    </div>
+    <div class="tpl">
+      <form class="grid2" id="tpl-form" onsubmit="return false">
+        <div class="field">
+          <label for="t-name">模板名称</label>
+          <input class="field-box" id="t-name">
+        </div>
+        <div class="field">
+          <span class="flabel" id="l-acc">投稿账号</span>
+          <div class="select" data-select="acc" aria-labelledby="l-acc"></div>
+        </div>
+        <div class="field span2">
+          <label for="t-title">标题</label>
+          <input class="field-box mono" id="t-title">
+          <div class="ph" aria-label="插入占位符">
+            <button type="button" data-ins="{name}">{name} 房间名</button>
+            <button type="button" data-ins="{title}">{title} 直播标题</button>
+            <button type="button" data-ins="{url}">{url} 直播间地址</button>
+            <button type="button" data-ins="%Y-%m-%d">%Y-%m-%d 开播日期</button>
+            <button type="button" data-ins="%H:%M">%H:%M 开播时刻</button>
+          </div>
+          <p class="render" id="t-render"></p>
+        </div>
+        <div class="field span2">
+          <label for="t-desc">简介</label>
+          <textarea class="field-box" id="t-desc"></textarea>
+        </div>
+        <div class="field">
+          <span class="flabel" id="l-tid">分区</span>
+          <div class="select" data-select="tid" aria-labelledby="l-tid"></div>
+        </div>
+        <div class="field span2">
+          <label for="t-tag">标签</label>
+          <div class="field-box tags-box" id="t-tags">
+            <input id="t-tag" placeholder="输入后回车">
+          </div>
+          <span class="hint">最多 10 个，房间的追加标签也算在内；B 站会拒收带逗号的标签。</span>
+        </div>
+        <div class="field">
+          <span class="flabel">类型</span>
+          <div class="seg" id="t-copy">
+            <button type="button" aria-pressed="false" data-v="1">自制</button>
+            <button type="button" aria-pressed="false" data-v="2">转载</button>
+          </div>
+        </div>
+        <div class="field" id="t-source-f">
+          <label for="t-source">转载来源</label>
+          <input class="field-box mono" id="t-source">
+        </div>
+        <div class="field span2" style="display:flex;flex-wrap:wrap;gap:1.5rem">
+          <button type="button" class="switch" role="switch" id="t-self" aria-checked="false"><span class="track"></span>仅自己可见</button>
+          <button type="button" class="switch" role="switch" id="t-quiet" aria-checked="false"><span class="track"></span>不发动态</button>
+        </div>
+        <div class="form-foot span2" style="padding-top:.5rem">
+          <button class="btn" type="button" id="t-save">保存</button>
+          <a class="btn-ghost" href="#templates">取消</a>
+          <span class="err" id="t-err" hidden></span>
+          <span class="spacer"></span>
+          <button class="danger" type="button" id="t-delete" data-danger="确认删除？">删除模板</button>
+        </div>
+      </form>
+      <aside class="field">
+        <span class="flabel">自动封面 · 1146×717</span>
+        <div class="cover" aria-label="封面预览"><div class="c1" id="c1"></div><div class="c2" id="c2"></div></div>
+        <span class="hint" id="c-hint"></span>
+      </aside>
+    </div>
+  </main>
+
+  <main data-view="accounts" hidden>
+    <section aria-labelledby="h-acc">
+      <div class="head">
+        <div>
+          <h2 class="label" id="h-acc">投稿账号</h2>
+          <p class="desc">cookie 只存在总控；preupload 限频按账号分别计算。</p>
+        </div>
+        <button class="btn" id="add-acc" type="button">添加账号</button>
+      </div>
+      <div id="qr" hidden></div>
+      <ul id="accounts"></ul>
+    </section>
+  </main>
+
+  <footer class="mono"><span id="version" data-tip="{{pushed_at}}" aria-describedby="tip">lubic · {{commit}}</span><button class="danger in" id="logout" type="button">退出登录</button></footer>
+</div>
+
+<script>
+const $ = (s, el = document) => el.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const enc = encodeURIComponent;
+
+// —— 主题 ——
+const root = document.documentElement;
+try { const t = localStorage.getItem('theme'); if (t) root.dataset.theme = t; } catch {}
+$('#theme').onclick = () => {
+  const dark = root.dataset.theme ? root.dataset.theme === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
+  root.dataset.theme = dark ? 'light' : 'dark';
+  try { localStorage.setItem('theme', root.dataset.theme); } catch {}
+};
+
+// —— 接口 ——
+let authed = false;
+class Unauth extends Error {}
+async function api(method, path, body) {
+  let res;
+  try {
+    const raw = body instanceof Blob;   // 图片等原样上传，其余按 JSON
+    res = await fetch(path, { method, headers: body ? { 'content-type': raw ? body.type : 'application/json' } : {}, body: raw ? body : body && JSON.stringify(body) });
+  } catch { throw new Error('连不上总控'); }
+  if (res.status === 401) { logout(); throw new Unauth('需要登录'); }
+  if (res.status === 403) { logout('控制台没有启用：总控配置里没有 admin_password_hash。'); throw new Unauth('没有启用'); }
+  const data = await res.json().catch(() => null);
+  if (!res.ok) throw new Error(data?.error || `请求失败（${res.status}）`);
+  return data;
+}
+function fail(el, e) { if (e instanceof Unauth) return; el.innerHTML = e.message.split('；').map(esc).join('<br>'); el.hidden = false; }
+
+// —— 格式 ——
+const pad = n => String(n).padStart(2, '0');
+const fmtDur = ms => { const s = Math.max(0, Math.floor(ms / 1000)); return `${Math.floor(s / 3600)}:${pad(Math.floor(s / 60) % 60)}:${pad(s % 60)}`; };
+const fmtBytes = b => { const u = ['B', 'KB', 'MB', 'GB', 'TB']; let i = 0; while (b >= 1024 && i < 4) { b /= 1024; i++; } return `${i ? b.toFixed(1) : b} ${u[i]}`; };
+const ago = t => { const s = Math.floor((Date.now() - t) / 1000); return s < 60 ? `${s} 秒前` : s < 3600 ? `${Math.floor(s / 60)} 分钟前` : s < 86400 ? `${Math.floor(s / 3600)} 小时前` : `${Math.floor(s / 86400)} 天前`; };
+const strftime = (f, d) => f.replace(/%([YmdHMS%])/g, (_, c) => ({ Y: d.getFullYear(), m: pad(d.getMonth() + 1), d: pad(d.getDate()), H: pad(d.getHours()), M: pad(d.getMinutes()), S: pad(d.getSeconds()), '%': '%' }[c]));
+const fmtDay = t => strftime('%m-%d %H:%M', new Date(t));
+function fmtAt(t) {
+  const d = new Date(t), now = new Date();
+  const same = d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth() && d.getDate() === now.getDate();
+  const abs = strftime(same ? '%H:%M' : '%m-%d %H:%M', d);
+  const diff = t - now.getTime();
+  if (diff <= 0) return `${abs}（即将）`;
+  const s = Math.floor(diff / 1000);
+  if (s < 60) return `${abs}（不到 1 分钟后）`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${abs}（${m} 分钟后）`;
+  const h = Math.floor(m / 60), rm = m % 60;
+  return `${abs}（${h} 小时${rm ? ` ${rm} 分钟` : ''}后）`;
+}
+const platform = url => /bilibili\.com/.test(url) ? 'B站' : /douyin\.com/.test(url) ? '抖音' : (() => { try { return new URL(url).hostname; } catch { return ''; } })();
+const shown = r => r.display_name || r.name;
+// B 站 qn 与抖音画质代码的叫法
+const BILI_QN = [[30000, '杜比'], [20000, '4K'], [25000, '原画真彩'], [10000, '原画'], [400, '蓝光'], [250, '超清'], [150, '高清'], [80, '流畅']];
+const DOUYIN_Q = [['origin', '原画'], ['uhd', '蓝光'], ['hd', '超清'], ['sd', '高清'], ['ld', '标清'], ['md', '流畅']];
+const QUALITY = { ...Object.fromEntries(BILI_QN), ...Object.fromEntries(DOUYIN_Q) };
+const accName = id => accounts.find(a => a.id === id)?.name ?? `账号 ${id}`;
+const num = el => { const v = el.value.trim(); return v === '' ? null : Number(v); };
+
+let rooms = [], machines = [], templates = [], accounts = [];
+let submits = { accounts: [], pending: [], submitted: [] };
+
+// —— 房间 ——
+let open = null;   // 展开的房间名，'__new' 表示新增
+let draft = null;
+let saved = null;  // 刚保存的房间名：行尾显示 2 秒「已保存」
+
+const PART = { open: 'rec', closed: 'q', uploading: 'ing', uploaded: 'up', lost: 'lost', empty: 'void' };
+const PART_NAME = { open: '在录', closed: '待传', uploading: '在传', uploaded: '已传', lost: '丢失', empty: '空段' };
+const LEGEND = [['up', '已传'], ['ing', '在传'], ['q', '待传'], ['rec', '在录'], ['void', '空段'], ['lost', '丢失']];
+const hms = t => new Date(t).toLocaleTimeString('zh-CN', { hour12: false });
+// 悬停一格看这一段：空段只说事实，不替证据下结论
+function tickTitle(p) {
+  const where = `${p.agent} · ${hms(p.opened_at)}–${p.closed_at ? hms(p.closed_at) : '…'}`;
+  if (p.state === 'empty') return `空段 · 未形成可用内容\n${where}\n最终文件仅 ${fmtBytes(p.size ?? 0)}，已自动丢弃，原因未确定`;
+  const name = PART_NAME[p.state] || p.state;
+  return `${p.state === 'uploading' ? `${name} ${Math.floor(p.progress * 100)}%` : name}\n${where}${p.size ? ` · ${fmtBytes(p.size)}` : ''}`;
+}
+function ticksHTML(parts) {
+  const n = s => parts.filter(p => p.state === s).length;
+  const ing = parts.find(p => p.state === 'uploading');
+  const extra = [['lost', '丢失'], ['empty', '空段']].map(([s, t]) => n(s) ? ` · ${t} ${n(s)}` : '').join('');
+  const title = `${parts.length - n('empty')} 个分P：已传 ${n('uploaded')}${ing ? ` · 在传 ${Math.floor(ing.progress * 100)}%` : ''} · 待传 ${n('closed')}${extra}`;
+  const tip = [title, ...parts.map((p, i) => `P${i + 1} ${tickTitle(p).replaceAll('\n', ' · ')}`)].join('\n');
+  return `<span class="ticks" title="${title}" data-tip="${esc(tip)}">${parts.map(p => `<i class="${PART[p.state] || 'q'}" title="${esc(tickTitle(p))}"${p.progress != null ? ` style="--p:${p.progress.toFixed(3)}"` : ''}></i>`).join('')}</span>`;
+}
+// 录制倍率低于 0.9（总控判受限的门槛）才提示
+function lowRate(r) {
+  const x = machines.find(m => m.name === r.agent)?.status.record_rates.find(([n]) => n === r.name)?.[1];
+  return x != null && x < 0.9 ? x : null;
+}
+// 在录这台机器上报的实际画质，平台没给到想要的档位时会自动降档
+function quality(r) {
+  const q = machines.find(m => m.name === r.agent)?.status.record_qualities?.find(([n]) => n === r.name)?.[1];
+  return q && (QUALITY[q] || q);
+}
+function lastLiveHTML(t) {
+  const d = new Date(t);
+  if (!Number.isFinite(d.getTime())) return '<span>—</span>';
+  const text = d.getFullYear() === new Date().getFullYear() ? fmtDay(t) : strftime('%Y-%m-%d %H:%M', d);
+  const title = `${strftime('%Y-%m-%d %H:%M:%S', d)} 开始录制（本地时间）`;
+  return `<span class="last-live" title="${title}"><span>上次直播 ·</span> <time datetime="${d.toISOString()}">${text}</time></span>`;
+}
+// 机器列定宽 9rem，等宽 .75rem 约 20 个字符：按优先级放得下几台放几台，剩下的记成 +N，全部机器在展开区的「优先机器」里
+const AGENTS_COLS = 20;
+const cols = s => [...s].reduce((n, c) => n + (c.charCodeAt(0) > 0xff ? 2 : 1), 0);
+function agentsBrief(list) {
+  const all = list.join(' · ');
+  if (cols(all) <= AGENTS_COLS) return all;
+  let k = 1;   // 第一台再长也留着，由 CSS 省略号兜底
+  while (k < list.length - 1 && cols(list.slice(0, k + 1).join(' · ')) + ` +${list.length - k - 1}`.length <= AGENTS_COLS) k++;
+  return `${list.slice(0, k).join(' · ')} +${list.length - k}`;
+}
+
+function rowHTML(r) {
+  const s = r.session, rate = s && lowRate(r), q = s && quality(r);
+  const idle = r.agents.length ? '未开播' : '已暂停';
+  const where = s ? (r.handoff_to ? `${r.agent} → ${r.handoff_to}` : r.agent || '等待分配') : agentsBrief(r.agents);
+  let note = s && r.handoff_to ? '<span class="note">交接中</span>' : rate ? `<span class="note">倍率 ${rate.toFixed(2)}×</span>` : '';
+  if (s && !r.agents.length) note += '<span class="note">本场结束后暂停</span>';
+  const pend = submits.pending.filter(p => p.room === r.name);
+  const pnote = pend.length ? `<span class="note" data-goto="submits">${pend.some(p => p.state === 'attention') ? '需人工' : `待投稿 ${pend.length}`}</span>` : '';
+  return `<button type="button" class="row ${s ? 'live' : 'idle'}${saved === r.name ? ' saved' : ''}" data-room="${esc(r.name)}" aria-expanded="${open === r.name}">
+    <span class="dot ${s ? 'on pulse' : ''}" aria-label="${s ? '在录' : idle}"></span>
+    <span class="name"><span class="n">${esc(shown(r))}</span><small>${esc(platform(r.url))}${q ? ` · ${esc(q)}` : ''}</small></span>
+    <span class="title">${s ? esc(s.title) + note + pnote : `<span style="color:var(--faint)">${idle}</span>` + pnote}</span>
+    <span class="where mono">${esc(where)}</span>
+    <span class="dur mono">${s ? `${ticksHTML(s.parts)}<span data-since="${s.started_at}">${fmtDur(Date.now() - s.started_at)}</span>` : r.last_live_started_at != null ? lastLiveHTML(r.last_live_started_at) : '<span>—</span>'}</span>
+  </button>`;
+}
+
+function chipsHTML() {
+  return machines.map(m => {
+    const i = draft.agents.indexOf(m.name);
+    const st = !m.enabled ? '停用' : !m.online ? '离线' : m.status.paused ? '停录中' : '';
+    return `<button type="button" class="chip ${i >= 0 ? 'sel' : ''}" data-agent="${esc(m.name)}" aria-pressed="${i >= 0}"><span class="n">${i >= 0 ? i + 1 : ''}</span>${esc(m.name)}${st ? `<span class="st">${st}</span>` : ''}</button>`;
+  }).join('');
+}
+
+function editorHTML(isNew) {
+  const d = draft, size = d.split === 'size';
+  const val = size ? d.split_size_mb : d.split_time != null ? d.split_time / 60 : '';
+  return `<form class="editor" onsubmit="return false">
+    <div class="grid2">
+      ${isNew ? '<div class="field span2"><label for="f-name">房间名</label><input class="field-box mono" id="f-name" placeholder="录制目录、文件名与标题里的 {name}，建好后不能改"></div>' : ''}
+      <div class="field span2"><label for="f-url">直播间地址</label><input class="field-box mono" id="f-url" value="${esc(d.url)}" placeholder="https://live.bilibili.com/…"></div>
+      <div class="field"><label for="f-display">显示名</label><input class="field-box" id="f-display" value="${esc(d.display_name)}" placeholder="封面第一行与文件名里的 {streamer}">
+        <span class="hint">${isNew ? '空着就用房间名。' : `房间名 <span class="mono">${esc(d.name)}</span>，空着就用它。`}</span></div>
+      <div class="field"><span class="flabel" id="l-ftpl">投稿模板</span><div class="select" data-select="room-tpl" aria-labelledby="l-ftpl"></div></div>
+      <div class="field"><span class="flabel" id="l-fseason">合集</span><div class="inline"><div class="select" data-select="room-season" aria-labelledby="l-fseason" style="flex:1"></div><button class="danger" type="button" data-danger="确认新建？" data-act="season-new" hidden>新建合集</button></div><span class="hint">投稿后加入；列的是模板账号下的合集。<span data-season-new hidden>新建用显示名作标题，已有同名的直接选中。</span></span></div>
+      <div class="field span2"><label for="f-tag">追加标签</label><div class="field-box tags-box" id="f-tags"><input id="f-tag" placeholder="输入后回车"></div><span class="hint"><span class="tag-count" id="f-tagcount"></span> 线框的是模板标签，投稿时排在前面；和模板重复的只算一次。</span></div>
+      <div class="field span2"><span class="flabel">优先机器</span><div class="chips" id="f-agents">${chipsHTML()}</div><span class="hint">按点击顺序排优先级，再点一次取消。不选机器并保存即可暂停，重新选择后恢复；正在录的这一场会继续录完。</span></div>
+      <div class="field"><span class="flabel">切段</span>
+        <div class="inline"><div class="seg" id="f-split"><button type="button" aria-pressed="${!size}" data-v="time">按时长</button><button type="button" aria-pressed="${size}" data-v="size">按大小</button></div>
+        <input class="field-box mono" id="f-splitval" value="${val ?? ''}" inputmode="numeric" placeholder="不切" style="width:5.5rem"><span class="unit" id="f-unit">${size ? 'MB' : '分钟'}</span></div></div>
+      <div class="field"><label for="f-grace">下播宽限</label><div class="inline"><input class="field-box mono" id="f-grace" value="${d.grace != null ? d.grace / 60 : ''}" inputmode="numeric" placeholder="5" style="width:5.5rem"><span class="unit">分钟内重新开播算同一场</span></div></div>
+      <div class="field"><span class="flabel" id="l-fqn">画质</span><div class="select" data-select="room-qn" aria-labelledby="l-fqn"></div><span class="hint">按直播间地址的平台选档；没有这一档时自动降档，下一场生效。</span></div>
+      ${isNew ? '' : `<div class="field span2"><span class="flabel">封面背景</span>
+        <img class="cover-img" id="f-cover" src="/api/rooms/${enc(d.name)}/cover" alt="封面预览">
+        <div class="inline"><button class="btn-ghost" type="button" data-act="bg-pick">${d.cover_bg ? '换一张' : '上传图片'}</button><button class="danger" type="button" data-danger="确认去掉？" data-act="bg-clear"${d.cover_bg ? '' : ' hidden'}>去掉背景</button><input type="file" accept="image/*" id="f-bgfile" hidden></div>
+        <span class="hint">居中裁成 1146×717、压暗一半垫在字下面；上传即生效，下一次投稿起使用。预览用已保存的显示名和此刻的时间。</span></div>`}
+      <div class="field span2"><button type="button" class="switch" role="switch" id="f-tail" aria-checked="${d.tail_upload}"><span class="track"></span>边录边传</button><span class="hint">每切一段就上传，下播后几分钟内就能投稿；需要按大小切段。</span></div>
+    </div>
+    <div class="form-foot">
+      <button class="btn" type="button" data-act="save">${isNew ? '添加' : '保存'}</button>
+      <button class="btn-ghost" type="button" data-act="cancel">取消</button>
+      <span class="err" id="f-err" hidden></span>
+      <span class="spacer"></span>
+      ${!isNew && d.session ? '<button class="danger" type="button" data-danger="确认结束本场？" data-act="end">立即结束本场</button>' : ''}
+      ${!isNew ? '<button class="danger" type="button" data-danger="确认删除？" data-act="delete">删除房间</button>' : ''}
+    </div>
+  </form>`;
+}
+
+function editorLi() {
+  const li = document.createElement('li');
+  const r = rooms.find(x => x.name === open);
+  li.dataset.for = open;
+  li.innerHTML = (r ? rowHTML(r) : '') + editorHTML(!r);
+  mountSelect($('[data-select="room-tpl"]', li), templates.map(t => ({ v: t.id, label: t.name, sub: accName(t.account_id) })), draft.template_id, v => {
+    if (accOf(v) !== accOf(draft.template_id)) draft.season_section_id = null;   // 合集是按账号的，换账号就清掉
+    draft.template_id = v; renderRoomTags(); mountSeason(li, accOf(v));
+  });
+  mountSeason(li, accOf(draft.template_id));
+  mountQuality(li);
+  renderRoomTags(false, li);
+  return li;
+}
+
+// 抖音房间改 douyin_quality，其余（B 站）改 bili_qn；改地址换了平台就重画
+function mountQuality(li) {
+  const el = $('[data-select="room-qn"]', li), d = draft;
+  if (platform($('#f-url', li)?.value ?? d.url) === '抖音')
+    mountSelect(el, [{ v: null, label: '默认', sub: '原画' }, ...DOUYIN_Q.map(([v, label]) => ({ v, label, sub: v }))], d.douyin_quality ?? null, v => d.douyin_quality = v);
+  else
+    mountSelect(el, [{ v: null, label: '默认', sub: '原画真彩' }, ...BILI_QN.map(([v, label]) => ({ v, label, sub: String(v) }))], d.bili_qn ?? null, v => d.bili_qn = v);
+}
+
+// 合集要问 B 站，按账号缓存；展开时先用缓存渲染，后台刷新有变再重画，取不到就只列当前值。
+// 账号能建合集（can_create）才显示「新建合集」，没取到也先藏着
+const seasonCache = new Map();   // 账号 id → seasons 接口的 data
+function fetchSeasons(acc) {
+  return api('GET', `/api/accounts/${acc}/seasons`).then(data => { if (data) seasonCache.set(acc, data); return data; }).catch(() => null);
+}
+// 由合集接口数据与当前分区 id 构造下拉选项
+function seasonOpts(data, cur) {
+  const opts = [{ v: null, label: '不加入合集' }, ...(data.seasons || []).flatMap(s => (s.sections?.sections || []).map(x => ({ v: x.id, label: s.season?.title ?? '合集', sub: x.title })))];
+  if (cur && !opts.some(o => o.v === cur)) opts.push({ v: cur, label: `合集分区 ${cur}` });
+  return opts;
+}
+async function mountSeason(li, acc) {
+  const el = $('[data-select="room-season"]', li), d = draft, cur = d.season_section_id ?? null, pick = v => d.season_section_id = v;
+  const showNew = on => li.querySelectorAll('[data-act="season-new"], [data-season-new]').forEach(x => x.hidden = !on), cached = acc && seasonCache.get(acc);
+  const initOpts = cached ? seasonOpts(cached, cur) : [{ v: cur, label: cur ? `合集分区 ${cur}` : '不加入合集' }];
+  mountSelect(el, initOpts, cur, pick);
+  showNew(cached?.can_create);
+  if (!acc) return;
+  const data = await fetchSeasons(acc);
+  if (draft !== d || accOf(d.template_id) !== acc || !data) return;
+  showNew(data.can_create);
+  const opts = seasonOpts(data, cur);
+  if (JSON.stringify(opts) !== JSON.stringify(initOpts)) mountSelect(el, opts, d.season_section_id ?? null, pick);
+}
+// 预取房间在用模板对应账号的合集列表
+function prefetchSeasons() {
+  new Set(rooms.map(r => accOf(r.template_id)).filter(Boolean)).forEach(fetchSeasons);
+}
+const accOf = tplId => templates.find(t => t.id === tplId)?.account_id;
+
+// 轮询重画列表时，展开着的那一行连同表单原样搬过去，一离开 DOM 焦点就丢、手机键盘会收起
+function renderList(list, items, cur, rowFn, editorFn, empty) {
+  const keep = [...list.children].find(li => li.dataset.for === cur);
+  let html = cur === '__new' ? '<li data-slot></li>' : '';
+  html += items.map(x => cur === x.name ? '<li data-slot></li>' : `<li>${rowFn(x)}</li>`).join('');
+  if (keep && html.includes('<li data-slot></li>')) {
+    const [before, after] = html.split('<li data-slot></li>');
+    [...list.children].forEach(li => li !== keep && li.remove());
+    keep.insertAdjacentHTML('beforebegin', before);
+    keep.insertAdjacentHTML('afterend', after);
+    return cur;
+  }
+  list.innerHTML = html || `<li class="empty">${empty}</li>`;
+  const slot = $('[data-slot]', list);
+  if (slot) { slot.replaceWith(keep || editorFn()); return cur; }
+  return null;
+}
+
+function renderRooms() {
+  const sorted = [...rooms].sort((a, b) => !!b.session - !!a.session);   // 在录置顶，其余保持 position
+  const live = rooms.filter(r => r.session).length;
+  $('#rooms-desc').innerHTML = `<b>${live}</b> 个在录 · 共 ${rooms.length} 个房间<span class="legend">${LEGEND.map(([k, t]) => `<span><span class="ticks"><i class="${k}"></i></span>${t}</span>`).join('')}</span>`;
+  document.title = live ? `● ${live} 在录 · lubic` : 'lubic 控制台';
+  document.body.classList.toggle('recording', live > 0);
+  open = renderList($('#rooms'), sorted, open, rowHTML, editorLi, '还没有房间，点右上角添加。');
+}
+
+function startEdit(name) {
+  open = open === name ? null : name;
+  if (open) {
+    const r = rooms.find(x => x.name === name);
+    draft = r ? structuredClone(r) : { name: '', url: '', display_name: '', template_id: templates[0]?.id, agents: [], split_time: null, split_size_mb: null, grace: null, bili_qn: null, douyin_quality: null, tail_upload: false, filename: '', season_section_id: null };
+    draft.split = draft.split_size_mb != null ? 'size' : 'time';
+    draft.tags = splitTags(draft.tag);
+  }
+  renderRooms();
+  if (open === '__new') $('#f-name').focus();
+}
+
+const rowOf = name => [...document.querySelectorAll('#rooms .row')].find(b => b.dataset.room === name);
+
+$('#add-room').onclick = () => startEdit('__new');
+$('#rooms').addEventListener('keydown', e => { if (e.target.id === 'f-tag') roomTagKey(e); });
+$('#rooms').addEventListener('input', e => { if (e.target.id === 'f-url') mountQuality(e.target.closest('li')); });
+$('#rooms').addEventListener('change', async e => {
+  if (e.target.id !== 'f-bgfile' || !e.target.files[0]) return;
+  const err = $('#f-err');
+  try { await setCoverBg(open, await coverJpeg(e.target.files[0])); err.hidden = true; } catch (x) { fail(err, x); }
+  e.target.value = '';
+});
+// 按封面尺寸居中裁切（同 CSS object-fit: cover），压成 JPEG
+async function coverJpeg(file) {
+  const img = await createImageBitmap(file).catch(() => { throw new Error('这张图打不开，换一张试试'); });
+  const W = 1146, H = 717, k = Math.max(W / img.width, H / img.height);
+  const c = Object.assign(document.createElement('canvas'), { width: W, height: H });
+  c.getContext('2d').drawImage(img, (W - img.width * k) / 2, (H - img.height * k) / 2, img.width * k, img.height * k);
+  return new Promise(ok => c.toBlob(ok, 'image/jpeg', 0.9));
+}
+// 上传或去掉（blob 为空）背景，就地更新预览和按钮，不重画表单（没保存的输入还在）
+async function setCoverBg(name, blob) {
+  await api(blob ? 'PUT' : 'DELETE', `/api/rooms/${enc(name)}/cover`, blob);
+  const has = !!blob, r = rooms.find(x => x.name === name);
+  if (r) r.cover_bg = has;
+  draft.cover_bg = has;
+  $('#f-cover').src = `/api/rooms/${enc(name)}/cover?t=${Date.now()}`;
+  $('[data-act="bg-pick"]').textContent = has ? '换一张' : '上传图片';
+  $('[data-act="bg-clear"]').hidden = !has;
+}
+$('#rooms').addEventListener('click', async e => {
+  if (e.target.closest('[data-goto]')) { location.hash = '#submits'; return; }
+  const box = e.target.closest('#f-tags');
+  if (box) { const b = e.target.closest('button'); if (b) { draft.tags.splice(+b.dataset.i, 1); renderRoomTags(); } else $('#f-tag').focus(); return; }
+  const t = e.target.closest('button'); if (!t) return;
+  if (t.dataset.room) return startEdit(t.dataset.room);
+  if (t.dataset.agent) {
+    const i = draft.agents.indexOf(t.dataset.agent);
+    i >= 0 ? draft.agents.splice(i, 1) : draft.agents.push(t.dataset.agent);
+    $('#f-agents').innerHTML = chipsHTML();
+    return;
+  }
+  if (t.closest('#f-split')) {
+    draft.split = t.dataset.v;
+    t.parentNode.querySelectorAll('button').forEach(b => b.setAttribute('aria-pressed', b === t));
+    $('#f-unit').textContent = draft.split === 'time' ? '分钟' : 'MB';
+    $('#f-splitval').value = draft.split === 'time' ? 60 : 2048;
+    return;
+  }
+  if (t.id === 'f-tail') { draft.tail_upload = !draft.tail_upload; t.setAttribute('aria-checked', draft.tail_upload); return; }
+  if (t.dataset.danger && !armed(t)) return;
+  const act = t.dataset.act, err = $('#f-err'), name = open;
+  if (act === 'cancel') { open = null; return renderRooms(); }
+  if (act === 'bg-pick') return $('#f-bgfile').click();
+  try {
+    if (act === 'save') {
+      const v = num($('#f-splitval')), g = num($('#f-grace'));
+      if ([v, g].some(x => x !== null && !(x > 0))) throw new Error('切段和宽限要填正数，或者空着');
+      const over = roomTagTotal() - TAG_MAX;
+      if (over > 0) throw new Error(`标签超过 ${TAG_MAX} 个，再去掉 ${over} 个`);
+      const { split, tags: roomTags, ...room } = draft;
+      room.tag = roomTags.join(',');
+      Object.assign(room, {
+        url: $('#f-url').value.trim(), display_name: $('#f-display').value.trim(),
+        split_time: split === 'time' && v ? Math.round(v * 60) : null,
+        split_size_mb: split === 'size' && v ? Math.round(v) : null,
+        grace: g ? Math.round(g * 60) : null,
+      });
+      if (name === '__new') {
+        room.name = $('#f-name').value.trim();
+        await api('POST', '/api/rooms', room);
+      } else await api('PUT', `/api/rooms/${enc(name)}`, room);
+      open = null; saved = room.name;
+      await refresh();
+      const row = rowOf(room.name);
+      row?.classList.add('flash'); row?.focus();
+      setTimeout(() => { saved = null; rowOf(room.name)?.classList.remove('saved'); }, 2000);
+    }
+    if (act === 'season-new') {
+      const acc = accOf(draft.template_id), title = $('#f-display').value.trim() || (name === '__new' ? $('#f-name').value.trim() : name);
+      if (!acc) throw new Error('先选投稿模板');
+      if (!title) throw new Error('先填显示名或房间名');
+      t.disabled = true;
+      try {
+        const { section_id } = await api('POST', `/api/accounts/${acc}/seasons`, { title });
+        await fetchSeasons(acc); draft.season_section_id = section_id; err.hidden = true;   // 先刷新缓存，挂上去直接是标题
+        mountSeason(t.closest('li'), acc);
+      } finally { t.disabled = false; }
+    }
+    if (act === 'bg-clear') { await setCoverBg(name, null); err.hidden = true; }
+    if (act === 'end') { await api('POST', `/api/rooms/${enc(name)}/end`); open = null; await refresh(); }
+    if (act === 'delete') { await api('DELETE', `/api/rooms/${enc(name)}`); open = null; await refresh(); }
+  } catch (e) { fail(err, e); }
+});
+
+// 危险按钮原地二次确认：第一下变文字，3 秒内再点才执行
+function armed(btn) {
+  if (btn.classList.contains('arm')) return true;
+  btn.dataset.orig = btn.textContent;
+  btn.textContent = btn.dataset.danger;
+  btn.classList.add('arm');
+  setTimeout(() => { if (btn.isConnected) { btn.textContent = btn.dataset.orig; btn.classList.remove('arm'); } }, 3000);
+  return false;
+}
+
+// —— 机器 ——
+let mopen = null;  // 展开的机器名，'__new' 表示新增
+
+// 总控的受限原因是给日志看的英文，这里翻成白话。旧格式（B/s）也认。
+function limitText(reason) {
+  const mbps = (v, unit) => (unit === 'B/s' ? v * 8e-6 : +v).toFixed(1);
+  const probe = reason.startsWith('probe ') ? '复查仍' : '';
+  const r = reason.replace(/^probe /, '');
+  let m;
+  if ((m = r.match(/^upload ([\d.]+) (Mbps|B\/s) < produce ([\d.]+) (Mbps|B\/s)$/)))
+    return `上传限速 · ${mbps(m[1], m[2])} Mbps，录制要 ${mbps(m[3], m[4])} Mbps`;
+  if ((m = r.match(/^record rate ([\d.]+)$/))) return `${probe}拉流限速 · 只有 ${m[1]} 倍速`;
+  if ((m = r.match(/^(?:record )?skipped (\d+)s\/(\d+)s$/))) return `${probe}拉流丢内容 · ${m[2]} 秒丢了 ${m[1]} 秒`;
+  return reason;
+}
+function machineNote(m) {
+  if (!m.online) return m.last_seen ? `离线 · ${ago(m.last_seen)}来过` : '等待接入';
+  const out = rooms.filter(r => r.handoff_to && r.agent === m.name).length;
+  if (out) return `迁出中 ${out} 个房间`;
+  if (m.drain && !m.drain.released_at) return '排空中：等在录的录完再更新';
+  if (m.limit && m.limit.until > Date.now()) return limitText(m.limit.reason);
+  if (m.status.paused) return '停录：硬盘到水位';
+  if (m.yield_until) return yieldText(m);
+  return '';
+}
+const yieldText = m => `让出网络至 ${strftime('%H:%M', new Date(m.yield_until))}`;
+// 明早 8:00：现在还没到今天 8 点就是今天的。
+const nextMorning = () => { const d = new Date(); d.setHours(8, 0, 0, 0); if (d <= new Date()) d.setDate(d.getDate() + 1); return d.getTime(); };
+function mrowHTML(m) {
+  const recs = rooms.filter(r => r.session && (r.agent === m.name || r.handoff_to === m.name)).map(shown);
+  const note = machineNote(m), s = m.status;
+  const ups = m.online ? m.uploading.map(([r, p]) => `在传 ${esc(roomShown(r))} <span class="mono">${Math.floor(p * 100)}%</span>`) : [];
+  // 在传放前面：在录名单长了被截断时，进度还看得到
+  const busy = [...ups, recs.length ? '在录 ' + recs.map(esc).join('、') : ''].filter(Boolean).join(' · ') || '空闲';
+  return `<button type="button" class="mrow${m.online ? '' : ' offline'}${m.enabled ? '' : ' disabled'}" data-machine="${esc(m.name)}" aria-expanded="${mopen === m.name}">
+    <span class="dot ${m.online ? 'on' : 'off'}" aria-label="${m.online ? '在线' : '离线'}"></span>
+    <span class="mname">${esc(m.name)}${m.enabled ? '' : '<small>停用</small>'}${m.note ? `<br><small>${esc(m.note)}</small>` : ''}</span>
+    <span class="mrooms">${note ? `<b>${esc(note)}</b>${recs.length ? ' · ' + busy : ''}` : busy}</span>
+    <span class="disk mono">${m.last_seen ? `<span class="bar ${s.paused ? 'hot' : ''}"><i style="width:${Math.min(100, s.disk_usage * 100)}%"></i></span>${Math.round(s.disk_usage * 100)}% · 剩 ${fmtBytes(s.disk_free)}` : '—'}</span>
+    <span class="queue mono">${s.queued_parts ? `待传 ${s.queued_parts} 段 · ${fmtBytes(s.queued_bytes)}` : '无待传'}</span>
+  </button>`;
+}
+const myieldHTML = m => m.yield_until
+  ? `<span>${esc(yieldText(m))}</span><button class="btn-ghost" type="button" data-mact="yield-end">结束</button>`
+  : `<button class="btn-ghost" type="button" data-mact="yield" data-hours="2">2 小时</button><button class="btn-ghost" type="button" data-mact="yield" data-hours="4">4 小时</button><button class="btn-ghost" type="button" data-mact="yield">到明早 8:00</button>`;
+function meditorHTML(m) {
+  if (!m) return `<form class="editor" onsubmit="return false">
+    <div class="grid2">
+      <div class="field"><label for="m-name">名字</label><input class="field-box mono" id="m-name" placeholder="1–32 位字母、数字、- 或 _，建好后不能改"></div>
+      <div class="field"><label for="m-note">备注</label><input class="field-box" id="m-note"></div>
+      <div class="field span2"><button type="button" class="switch" role="switch" id="m-add-rooms" aria-checked="false"><span class="track"></span>加到所有房间的优先列表末尾</button></div>
+    </div>
+    <div class="form-foot">
+      <button class="btn" type="button" data-mact="save">添加</button>
+      <button class="btn-ghost" type="button" data-mact="cancel">取消</button>
+      <span class="err" id="m-err" hidden></span>
+    </div>
+  </form>`;
+  return `<form class="editor" onsubmit="return false">
+    <div class="grid2">
+      <div class="field"><label for="m-note">备注</label><input class="field-box" id="m-note" value="${esc(m.note)}"></div>
+      <div class="field">
+        <span class="flabel">token</span>
+        <div class="inline" id="m-token"><span class="mono" style="color:var(--faint)">••••••••</span><button class="btn-ghost" type="button" data-mact="token">显示</button></div>
+        <span class="hint" id="m-token-hint" hidden></span>
+      </div>
+    </div>
+    <div class="field">
+      <span class="flabel">让出网络</span>
+      <div class="inline" id="m-yield">${myieldHTML(m)}</div>
+      <span class="hint">在录的房间迁走，别的机器都不能录时才用它；暂停上传，到点自动恢复。</span>
+    </div>
+    <span class="hint">停用后不再分配新房间，在录的房间交接到其他机器；已录的分段照常传完。</span>
+    <div class="field" id="m-force" hidden>
+      <label for="m-force-name">输入机器名确认</label>
+      <div class="inline">
+        <input class="field-box mono" id="m-force-name" placeholder="输入机器名确认" style="max-width:14rem">
+        <button class="danger" type="button" data-mact="force">强制移除</button>
+      </div>
+      <span class="hint">机器已经没了时用：撤掉它的分配，没传完的分段记为丢失。</span>
+    </div>
+    <div class="form-foot">
+      <button class="btn" type="button" data-mact="save">保存</button>
+      <button class="btn-ghost" type="button" data-mact="cancel">取消</button>
+      <span class="err" id="m-err" hidden></span>
+      <span class="spacer"></span>
+      <button class="danger" type="button" data-mact="toggle"${m.enabled ? ' data-danger="确认停用？"' : ''}>${m.enabled ? '停用' : '启用'}</button>
+      <button class="danger" type="button" data-mact="reset-token" data-danger="旧 token 立即失效，确认？">重置 token</button>
+      <button class="danger" type="button" data-mact="remove" data-danger="确认移除？">移除</button>
+      ${!m.online ? '<button class="danger" type="button" data-mact="force-open">强制移除</button>' : ''}
+    </div>
+  </form>`;
+}
+function meditorLi() {
+  const li = document.createElement('li');
+  const m = machines.find(x => x.name === mopen);
+  li.dataset.for = mopen;
+  li.innerHTML = (m ? mrowHTML(m) : '') + meditorHTML(m);
+  return li;
+}
+function renderMachines() {
+  mopen = renderList($('#machines'), machines, mopen, mrowHTML, meditorLi, '还没有机器，点右上角新增。');
+}
+function startMachineEdit(name) {
+  mopen = mopen === name ? null : name;
+  renderMachines();
+  if (mopen === '__new') $('#m-name')?.focus();
+}
+function renderToken(token, hint) {
+  $('#m-token').innerHTML = `<span class="mono" style="user-select:all;word-break:break-all">${esc(token)}</span><button class="btn-ghost" type="button" data-copy="${esc(token)}" style="flex:none">复制</button>`;
+  const h = $('#m-token-hint');
+  if (hint) { h.textContent = hint; h.hidden = false; }
+}
+async function copyText(btn) {
+  await navigator.clipboard.writeText(btn.dataset.copy);
+  btn.textContent = '已复制';
+  setTimeout(() => { if (btn.isConnected) btn.textContent = '复制'; }, 2000);
+}
+const mrowOf = name => [...document.querySelectorAll('#machines .mrow')].find(b => b.dataset.machine === name);
+
+$('#add-machine').onclick = () => startMachineEdit('__new');
+$('#machines').addEventListener('click', async e => {
+  const t = e.target.closest('button'); if (!t) return;
+  if (t.dataset.machine) return startMachineEdit(t.dataset.machine);
+  if (t.dataset.copy != null) return copyText(t);
+  if (t.id === 'm-add-rooms') { t.setAttribute('aria-checked', t.getAttribute('aria-checked') !== 'true'); return; }
+  if (t.dataset.danger && !armed(t)) return;
+  const act = t.dataset.mact, err = $('#m-err'), name = mopen, li = t.closest('li');
+  if (!act) return;
+  if (act === 'cancel') { mopen = null; return renderMachines(); }
+  if (act === 'done') { mopen = null; return refresh(); }
+  if (err) err.hidden = true;
+  try {
+    if (act === 'force-open') { $('#m-force').hidden = false; $('#m-force-name').focus(); return; }
+    if (act === 'token') {
+      const { token } = await api('GET', `/api/machines/${enc(name)}/token`);
+      return renderToken(token);
+    }
+    if (act === 'reset-token') {
+      const { token } = await api('POST', `/api/machines/${enc(name)}/token`);
+      return renderToken(token, '把它换进那台的 agent.toml 并重启 agent；在录的房间不受影响。');
+    }
+    if (act === 'save') {
+      if (name === '__new') {
+        const res = await api('POST', '/api/machines', {
+          name: $('#m-name').value.trim(),
+          note: $('#m-note').value.trim(),
+          add_to_rooms: $('#m-add-rooms').getAttribute('aria-checked') === 'true',
+        });
+        const snippet = `controller = "${location.origin}"\ntoken = "${res.token}"`;
+        li.innerHTML = `<div class="editor">
+          <p>已添加 <b>${esc(res.name)}</b>。去那台按 <span class="mono">docs/deploy.md</span> 部署 agent，把下面两行写进 <span class="mono">agent.toml</span>，回来看它变成在线。</p>
+          <div class="inline">
+            <pre class="field-box mono" style="user-select:all;word-break:break-all;white-space:pre-wrap;flex:1">${esc(snippet)}</pre>
+            <button class="btn-ghost" type="button" data-copy="${esc(snippet)}" style="flex:none">复制</button>
+          </div>
+          <div class="form-foot"><button class="btn-ghost" type="button" data-mact="done">完成</button></div>
+        </div>`;
+        return refresh();
+      }
+      await api('PUT', `/api/machines/${enc(name)}`, { note: $('#m-note').value.trim() });
+      mopen = null; await refresh();
+      const row = mrowOf(name); row?.classList.add('flash'); row?.focus();
+    }
+    if (act === 'toggle') {
+      const m = machines.find(x => x.name === name);
+      await api('PUT', `/api/machines/${enc(name)}`, { enabled: !m.enabled });
+      await refresh();
+      const u = machines.find(x => x.name === name);
+      if (u && li?.isConnected) {
+        $('.mrow', li)?.replaceWith(Object.assign(document.createElement('div'), { innerHTML: mrowHTML(u) }).firstElementChild);
+        t.dataset.orig = t.textContent = u.enabled ? '停用' : '启用';
+        t.classList.remove('arm');
+        u.enabled ? t.dataset.danger = '确认停用？' : delete t.dataset.danger;
+      }
+    }
+    if (act === 'yield' || act === 'yield-end') {
+      const until = act === 'yield-end' ? null : t.dataset.hours ? Date.now() + t.dataset.hours * 3600e3 : nextMorning();
+      await api('PUT', `/api/machines/${enc(name)}/yield`, { until });
+      await refresh();
+      // 编辑区留着（备注可能改了一半），只换行与这一栏
+      const u = machines.find(x => x.name === name);
+      if (u && li?.isConnected) {
+        $('.mrow', li)?.replaceWith(Object.assign(document.createElement('div'), { innerHTML: mrowHTML(u) }).firstElementChild);
+        $('#m-yield').innerHTML = myieldHTML(u);
+      }
+    }
+    if (act === 'remove') { await api('DELETE', `/api/machines/${enc(name)}`); mopen = null; await refresh(); }
+    if (act === 'force') {
+      if ($('#m-force-name').value !== name) throw new Error('机器名不对');
+      await api('DELETE', `/api/machines/${enc(name)}?force=1`);
+      mopen = null; await refresh();
+    }
+  } catch (e) { fail(err, e); }
+});
+
+// —— 投稿 ——
+const roomShown = name => { const r = rooms.find(x => x.name === name); return r ? shown(r) : name; };
+
+function pendingStateHTML(p) {
+  switch (p.state) {
+    case 'uploading': return `分P未传完 · 还差 <span class="mono">${p.parts_total - p.parts_uploaded}</span> 段${p.progress != null ? ` · 当前 <span class="mono">${Math.floor(p.progress * 100)}%</span>` : ''}`;
+    case 'backoff': return `失败退避中 · 最早 <span class="mono">${esc(fmtAt(p.at))}</span><button class="danger" type="button" data-retry="${p.id}">立即重试</button>`;
+    case 'probe': return `<b>账号停投 · 下次试探 <span class="mono">${esc(fmtAt(p.at))}</span></b>`;
+    case 'paused': return '<b>账号停投</b>';
+    case 'hold': return `等主播重连 · 最早 <span class="mono">${esc(fmtAt(p.at))}</span> 投稿`;
+    case 'interval': return `等投稿间隔 · 最早 <span class="mono">${esc(fmtAt(p.at))}</span>`;
+    case 'ready': return '即将投稿';
+    case 'submitting': return '<b>投稿中</b>';
+    case 'attention': return '<b>需人工</b>';
+    default: return esc(p.state);
+  }
+}
+
+function renderSubmits() {
+  const alert = submits.accounts.some(a => a.strikes > 0 && a.submit_after) || submits.pending.some(p => p.state === 'attention');
+  $('[data-nav="submits"] .alert').hidden = !alert;
+
+  $('#s-accounts').innerHTML = submits.accounts.map(a => {
+    const paused = a.strikes > 0 && a.submit_after;
+    const st = paused ? `<b>停投 · 第 <span class="mono">${a.strikes}</span> 次 · 试探 <span class="mono">${esc(fmtAt(a.submit_after))}</span></b>`
+      : a.submit_after ? `最早 <span class="mono">${esc(fmtAt(a.submit_after))}</span>` : '可投';
+    return `<li><div class="srow">
+      <span class="dot ${paused ? 'on' : ''}"></span>
+      <span class="sname"><span class="n">${esc(a.name)}</span></span>
+      <span class="stitle"></span>
+      <span class="sparts"></span>
+      <div class="sstate">${st}</div>
+    </div></li>`;
+  }).join('') || '<li class="empty">还没有账号。</li>';
+
+  const multi = submits.accounts.length > 1;
+  $('#pending-desc').innerHTML = `<b>${submits.pending.length}</b> 份待投 · 按投稿顺序`;
+  $('#s-pending').innerHTML = submits.pending.map(p => {
+    const dot = p.state === 'submitting' ? 'on pulse' : (p.state === 'attention' || p.state === 'probe' || p.state === 'paused') ? 'on' : '';
+    const acc = multi && p.account_id != null ? `${esc(accName(p.account_id))} · ` : '';
+    const why = p.note ? `<div class="why" title="${esc(p.note)}">${esc(p.note)}</div>` : '';
+    const arm = discardArm && discardArm.id === p.id && Date.now() < discardArm.until;
+    const discard = p.state === 'submitting' ? '' : `<button class="danger${arm ? ' arm' : ''}" type="button" data-discard="${p.id}">${arm ? '确认丢弃？不投稿、删录像' : '丢弃'}</button>`;
+    return `<li><div class="srow">
+      <span class="dot ${dot}"></span>
+      <span class="sname"><span class="n">${esc(roomShown(p.room))}</span><small class="mono">${acc}${esc(fmtDay(p.started_at))}</small></span>
+      <span class="stitle">${esc(p.title)}</span>
+      <span class="sparts mono">${p.parts_uploaded}/${p.parts_total}</span>
+      <div class="sstate"><div>${pendingStateHTML(p)}${discard}</div>${why}</div>
+    </div></li>`;
+  }).join('') || '<li class="empty">没有待投的稿件。</li>';
+
+  renderDone();
+}
+
+// 已投：先显示 DONE_PAGE 份，按钮或日期刻度再往前展开；展开状态跨轮询保留，刷新页面重置
+const DONE_PAGE = 10;
+let doneShown = DONE_PAGE, doneDrawn = DONE_PAGE;
+function renderDone() {
+  const all = submits.submitted, shown = all.slice(0, doneShown);
+  $('#done-desc').innerHTML = `最近 7 天投出 <b>${all.length}</b> 份。`;
+  $('#s-done').innerHTML = shown.map((x, i) => `<li${i >= doneDrawn ? ` class="rise" style="animation-delay:${(i - doneDrawn) * 40}ms"` : ''}><div class="srow">
+    <span class="dot"></span>
+    <span class="sname"><span class="n">${esc(roomShown(x.room))}</span><small class="mono">${esc(fmtDay(x.started_at))}</small></span>
+    <span class="stitle">${esc(x.title)}</span>
+    <span class="sparts"></span>
+    <div class="sstate"><div><a class="mono" href="https://www.bilibili.com/video/${esc(x.bvid)}" target="_blank" rel="noopener">${esc(x.bvid)}</a></div><div class="why mono">${esc(fmtDay(x.submitted_at))} 投出</div></div>
+  </div></li>`).join('') || '<li class="empty">7 天内没有投出的稿件。</li>';
+  doneDrawn = shown.length;
+  const box = $('#s-done-more'), focus = box.contains(document.activeElement) && document.activeElement.dataset.more;
+  if (all.length <= DONE_PAGE) { box.innerHTML = ''; return; }
+  // 窗口是往前 168 小时，横跨 8 个自然日；每格一天，记当天总数、已显示数和含当天在内一共多少份
+  const today = new Date().setHours(0, 0, 0, 0);
+  const dayOf = t => Math.round((today - new Date(t).setHours(0, 0, 0, 0)) / 864e5);
+  const days = Array.from({ length: 8 }, (_, d) => ({ d, n: 0, seen: 0, upto: 0 }));
+  all.forEach((x, i) => { const c = days[Math.min(7, Math.max(0, dayOf(x.submitted_at)))]; c.n++; if (i < doneShown) c.seen++; });
+  days.reduce((acc, c) => (c.upto = acc + c.n), 0);
+  const ticks = days.map(c => {
+    const label = `${strftime('%m-%d', new Date(today - c.d * 864e5))} · ${c.n} 份`;
+    const cls = !c.n ? 'none' : c.seen === c.n ? '' : c.seen ? 'ing' : 'q';
+    const p = cls === 'ing' ? ` style="--p:${(c.seen / c.n).toFixed(2)}"` : '';
+    return `<button type="button" data-more="${c.upto}" title="${label}" aria-label="${label}，展开到这天"${!c.n || c.seen === c.n ? ' aria-disabled="true"' : ''}><i class="${cls}"${p}></i></button>`;
+  }).join('');
+  const rest = all.length - doneShown;
+  box.innerHTML = (rest > 0
+    ? `<button type="button" class="btn-ghost" data-more="${doneShown + DONE_PAGE}">${rest > DONE_PAGE ? `再显示 ${DONE_PAGE} 份（还剩 ${rest}）` : `显示剩下 ${rest} 份`}</button>`
+    : '<span class="why">7 天都翻完了，再往前去<a href="https://member.bilibili.com/platform/upload-manager/article" target="_blank" rel="noopener">创作中心 ↗</a></span>')
+    + `<span class="ticks days" role="group" aria-label="按天展开">${ticks}</span>`;
+  // 每次重绘都会换掉按钮，焦点留在原来那个位置（按钮没了就落到刻度上）
+  if (focus) (box.querySelector(`[data-more="${focus}"]:not([aria-disabled])`) || box.querySelector('[data-more]:not([aria-disabled])') || box.querySelector('a'))?.focus();
+}
+
+$('#s-done-more').addEventListener('click', e => {
+  const btn = e.target.closest('[data-more]:not([aria-disabled])');
+  if (!btn) return;
+  doneShown = Math.max(doneShown, +btn.dataset.more);
+  renderDone();
+});
+
+// 丢弃的二次确认记在这里：列表每 5 秒重绘，按钮上的确认态会被冲掉
+let discardArm = null;
+$('#s-pending').addEventListener('click', async e => {
+  const btn = e.target.closest('[data-retry], [data-discard]');
+  if (!btn) return;
+  if (btn.dataset.discard) {
+    const id = +btn.dataset.discard;
+    if (!discardArm || discardArm.id !== id || Date.now() >= discardArm.until) {
+      discardArm = { id, until: Date.now() + 3000 };
+      renderSubmits();
+      setTimeout(renderSubmits, 3000);
+      return;
+    }
+    discardArm = null;
+  }
+  try { await api('POST', btn.dataset.discard ? `/api/archives/${btn.dataset.discard}/discard` : `/api/archives/${btn.dataset.retry}/retry`); }
+  catch (err) { if (err instanceof Unauth) return; }
+  await refresh().catch(() => {});
+});
+
+// —— 轮询与心跳 ——
+let lastPoll = Date.now();
+const beat = $('#beat'), tip = $('#tip');
+let tipFor = null;  // 触屏浮窗当前指着的元素
+async function refresh() {
+  [rooms, machines, submits] = await Promise.all([api('GET', '/api/rooms'), api('GET', '/api/machines'), api('GET', '/api/submits')]);
+  renderRooms(); renderMachines(); renderSubmits();
+  lastPoll = Date.now();
+  beat.classList.remove('tick'); void beat.offsetWidth; beat.classList.add('tick');
+  renderBeat();
+}
+function renderBeat() {
+  const ago = Math.floor((Date.now() - lastPoll) / 1000), lost = authed && ago >= 15;
+  beat.querySelector('.dot').classList.toggle('on', !lost);
+  beat.querySelector('.beat-text').textContent = beat.dataset.tip = lost ? `连接中断 · ${ago} 秒` : `${ago} 秒前更新`;
+  if (tipFor === beat) tip.textContent = beat.dataset.tip;
+  const bar = $('#lost-bar');
+  if (bar.hidden === lost) bar.hidden = !lost;
+  if (lost) bar.innerHTML = `连接中断 · <span class="mono">${ago}</span> 秒没有更新<span class="why">，页面上的状态可能已经过时，正在重试</span>`;
+  beat.setAttribute('aria-label', lost ? `连接中断，${ago} 秒没有更新` : `连接正常，${ago} 秒前更新`);
+}
+beat.onclick = () => refresh().catch(() => {});
+
+// 触屏点按看提示；链接、按钮保留原生动作，刻度等非交互元素吞掉这次点击。
+document.addEventListener('click', e => {
+  if (!matchMedia('(hover: none)').matches) return;
+  if (e.target.closest('a[href]')) return;
+  const el = e.target.closest('[data-tip]') || e.target.closest('[title]');
+  if (!el) return;
+  if (el.tagName !== 'BUTTON') { e.stopPropagation(); e.preventDefault(); }
+  showTip(el);
+}, true);
+function showTip(el) {
+  tipFor = el; tip.textContent = el.dataset.tip ?? el.title;
+  if (!tip.matches(':popover-open')) tip.showPopover();
+  const anchor = el.id === 'version' ? el.firstElementChild : el;
+  const r = anchor.getBoundingClientRect(), w = tip.offsetWidth, h = tip.offsetHeight;
+  const gap = Math.max(4, Math.min(8, innerHeight * .01));
+  const above = r.top - gap - h, below = r.bottom + gap;
+  const top = below + h > innerHeight - 8 ? above : below;
+  tip.style.left = `${Math.max(16, Math.min(r.left + r.width / 2 - w / 2, innerWidth - 16 - w))}px`;
+  tip.style.top = `${Math.max(8, Math.min(top, innerHeight - 8 - h))}px`;
+}
+// 版本号支持悬停、键盘聚焦和触屏长按；短号链接保留原生跳转。
+const version = $('#version');
+let versionHold;
+function clearVersionHold() { clearTimeout(versionHold); }
+version.addEventListener('pointerenter', e => { if (e.pointerType === 'mouse') showTip(version); });
+version.addEventListener('pointerleave', () => {
+  clearVersionHold();
+  if (tipFor === version && !version.contains(document.activeElement)) tip.hidePopover();
+});
+version.addEventListener('focusin', () => showTip(version));
+version.addEventListener('focusout', () => { if (tipFor === version) tip.hidePopover(); });
+version.addEventListener('pointerdown', e => {
+  if (e.pointerType === 'touch') versionHold = setTimeout(() => showTip(version), 500);
+});
+for (const event of ['pointerup', 'pointercancel', 'pointermove']) version.addEventListener(event, clearVersionHold);
+tip.addEventListener('toggle', e => { if (e.newState === 'closed') tipFor = null; });
+addEventListener('scroll', () => tip.matches(':popover-open') && tip.hidePopover(), { passive: true });
+addEventListener('resize', () => { if (tipFor && tip.matches(':popover-open')) showTip(tipFor); });
+let since = 0;
+setInterval(() => {
+  document.querySelectorAll('[data-since]').forEach(el => el.textContent = fmtDur(Date.now() - +el.dataset.since));
+  if (authed && ++since >= 5) { since = 0; refresh().catch(() => {}); }
+  renderBeat();
+}, 1000);
+
+// —— 自写下拉 ——
+function mountSelect(el, opts, value, onPick) {
+  if (!el) return;
+  const cur = opts.find(o => o.v === value) || opts[0] || { v: null, label: '—' };
+  el.innerHTML = `<button type="button" class="field-box" aria-haspopup="listbox" aria-expanded="false">${esc(cur.label)}</button>
+    <ul role="listbox" hidden>${opts.map((o, i) => `<li role="option" tabindex="-1" data-i="${i}" aria-selected="${o === cur}">${esc(o.label)}${o.sub ? `<small>${esc(o.sub)}</small>` : ''}</li>`).join('')}</ul>`;
+  const btn = el.firstElementChild, list = el.lastElementChild;
+  const close = () => { list.hidden = true; btn.setAttribute('aria-expanded', false); };
+  btn.onclick = e => { e.stopPropagation(); const o = list.hidden; document.querySelectorAll('.select ul').forEach(u => u.hidden = true); list.hidden = !o; btn.setAttribute('aria-expanded', o); if (o) (list.querySelector('[aria-selected="true"]') || list.firstElementChild)?.focus(); };
+  list.onclick = e => { const li = e.target.closest('li'); if (!li) return; const o = opts[+li.dataset.i]; onPick && onPick(o.v); mountSelect(el, opts, o.v, onPick); el.firstElementChild.focus(); };
+  list.onkeydown = e => {
+    const items = [...list.children], i = items.indexOf(document.activeElement);
+    if (e.key === 'ArrowDown') { e.preventDefault(); items[Math.min(i + 1, items.length - 1)].focus(); }
+    if (e.key === 'ArrowUp') { e.preventDefault(); items[Math.max(i - 1, 0)].focus(); }
+    if (e.key === 'Enter') { e.preventDefault(); document.activeElement.click(); }
+    if (e.key === 'Escape') { close(); btn.focus(); }
+  };
+}
+document.addEventListener('click', () => document.querySelectorAll('.select ul').forEach(u => u.hidden = true));
+
+// —— 模板 ——
+const accountTypes = new Map();
+function accountTypeOptions(id) {
+  if (!id) return Promise.resolve({ type_mode: 0, legacy: [], human: [] });
+  if (!accountTypes.has(id)) accountTypes.set(id, api('GET', `/api/accounts/${id}/types`).then(data => {
+    if (!Array.isArray(data?.typelist) || !Array.isArray(data?.human_type_list)) throw new Error('分区列表格式有误');
+    return {
+      type_mode: data.type_mode,
+      legacy: data.typelist.flatMap(p => p.children?.length ? p.children.map(c => ({ v: c.id, label: c.name, sub: p.name })) : [{ v: p.id, label: p.name }]),
+      human: data.human_type_list.map(t => ({ v: t.id, label: t.name })),
+    };
+  }).catch(e => { accountTypes.delete(id); throw e; }));
+  return accountTypes.get(id);
+}
+async function renderTemplates() {
+  const list = templates;
+  $('#templates').innerHTML = templates.map(t => {
+    const n = rooms.filter(r => r.template_id === t.id).length;
+    return `<li style="border-bottom:1px solid var(--border)"><a class="lrow" href="#template/${t.id}">
+    <span class="t">${esc(t.name)}</span>
+    <span class="r">${esc(accName(t.account_id))} · 分区 <span data-template-tid="${t.id}">${t.human_type2 || t.tid}</span><br>${n ? `<b>${n}</b> 个房间在用` : '没有房间在用'}</span>
+    <span class="s mono">${esc(t.title)}</span></a></li>`;
+  }).join('') || '<li class="empty">还没有模板。</li>';
+  await Promise.all(list.map(async t => {
+    const data = await accountTypeOptions(t.account_id).catch(() => null);
+    if (templates !== list) return;
+    const value = t.human_type2 || t.tid, opts = (t.human_type2 ? data?.human : data?.legacy) || [];
+    const el = $(`[data-template-tid="${t.id}"]`), type = opts.find(o => o.v === value);
+    if (el && type) { el.textContent = `${value}（${type.label}）`; el.title = [type.sub, type.label].filter(Boolean).join(' / '); }
+  }));
+}
+
+let tpl = null;    // 正在编辑的模板
+const tTitle = $('#t-title');
+// 用一个在用这个模板的房间预览：优先正在录的那场
+function sample() {
+  const using = rooms.filter(r => r.template_id === tpl.id);
+  const r = using.find(r => r.session) || using[0] || rooms[0];
+  return { r, title: r?.session?.title || '直播标题', at: new Date(r?.session?.started_at || Date.now()) };
+}
+function renderTitle() {
+  const { r, title, at } = sample();
+  const s = strftime(tTitle.value.replace('{name}', r?.name ?? '房间名').replace('{title}', title).replace('{url}', r?.url ?? ''), at);
+  $('#t-render').innerHTML = `${esc(r ? shown(r) : '示例')}${r?.session ? '本场' : ''}会生成：<b>${esc(s)}</b> <span class="mono">${[...s].length}/80</span>`;
+  $('#c1').textContent = r ? shown(r) : '主播名';
+  $('#c2').textContent = strftime('%Y-%m-%d %H点场', at);
+  $('#c-hint').textContent = `用「${r ? shown(r) : '示例'}」${r?.session ? '本场' : ''}的数据预览；每场按开播时间生成，跨机接力也是同一张。`;
+}
+tTitle.oninput = renderTitle;
+$('#t-name').oninput = e => $('#tpl-h1').textContent = e.target.value || '未命名模板';
+document.querySelectorAll('[data-ins]').forEach(b => b.onclick = () => {
+  const p = tTitle.selectionStart ?? tTitle.value.length;
+  tTitle.value = tTitle.value.slice(0, p) + b.dataset.ins + tTitle.value.slice(tTitle.selectionEnd ?? p);
+  tTitle.focus(); renderTitle();
+});
+// 标签输入框（模板与房间共用）：回车加、点 × 或空框退格删；B 站一份稿件最多 10 个。
+const TAG_MAX = 10;
+const splitTags = s => (s || '').split(',').map(t => t.trim()).filter(Boolean);
+function renderTags(box, list) {
+  const input = box.querySelector('input');
+  box.querySelectorAll('.tag').forEach(n => n.remove());
+  list.forEach((t, i) => box.insertBefore(Object.assign(document.createElement('span'), { className: 'tag', innerHTML: `${esc(t)}<button type="button" aria-label="移除标签 ${esc(t)}" data-i="${i}">×</button>` }), input));
+}
+function tagsClick(e, box, list) {
+  const b = e.target.closest('button');
+  if (b) { list.splice(+b.dataset.i, 1); renderTags(box, list); } else box.querySelector('input').focus();
+}
+function tagsKey(e, box, list) {
+  const v = e.target.value.trim();
+  if (e.key === 'Enter') e.preventDefault();
+  if (e.key === 'Enter' && v && !v.includes(',') && !list.includes(v) && list.length < TAG_MAX) { list.push(v); e.target.value = ''; renderTags(box, list); }
+  if (e.key === 'Backspace' && !e.target.value && list.length) { list.pop(); renderTags(box, list); }
+}
+// 房间追加标签框：前面列模板标签（只读），后面是房间的；计数按去重后的合计。
+const roomTpl = () => splitTags(templates.find(t => t.id === draft.template_id)?.tag);
+const roomTagTotal = () => new Set([...roomTpl(), ...draft.tags]).size;
+function renderRoomTags(flashOver, root = document) {
+  const box = $('#f-tags', root); if (!box) return;
+  renderTags(box, draft.tags);
+  const input = box.querySelector('input');
+  roomTpl().forEach(t => box.insertBefore(Object.assign(document.createElement('span'), { className: 'tag from-tpl', title: '来自模板', textContent: t }), box.querySelector('.tag:not(.from-tpl)') || input));
+  const n = roomTagTotal(), over = n - TAG_MAX, c = $('#f-tagcount', root);
+  c.textContent = `${n}/${TAG_MAX}` + (over > 0 ? `，再去掉 ${over} 个。` : '。');
+  c.classList.toggle('over', over > 0 || !!flashOver);
+  if (flashOver && over <= 0) setTimeout(() => c.classList.remove('over'), 1200);
+}
+function roomTagKey(e) {
+  const v = e.target.value.trim();
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    if (!v || v.includes(',') || draft.tags.includes(v) || roomTpl().includes(v)) return;
+    if (roomTagTotal() >= TAG_MAX) return renderRoomTags(true);
+    draft.tags.push(v); e.target.value = ''; renderRoomTags();
+  }
+  if (e.key === 'Backspace' && !e.target.value && draft.tags.length) { draft.tags.pop(); renderRoomTags(); }
+}
+let tags = [];
+$('#t-tags').onclick = e => tagsClick(e, $('#t-tags'), tags);
+$('#t-tag').onkeydown = e => tagsKey(e, $('#t-tags'), tags);
+function setCopyright(v) {
+  tpl.copyright = v;
+  $('#t-copy').querySelectorAll('button').forEach(x => x.setAttribute('aria-pressed', +x.dataset.v === v));
+  $('#t-source-f').hidden = v === 1;
+}
+$('#t-copy').onclick = e => { const b = e.target.closest('button'); if (b) setCopyright(+b.dataset.v); };
+$('#t-self').onclick = () => $('#t-self').setAttribute('aria-checked', tpl.is_only_self = !tpl.is_only_self);
+$('#t-quiet').onclick = () => $('#t-quiet').setAttribute('aria-checked', tpl.no_disturbance = !tpl.no_disturbance);
+
+// 分区要问 B 站，按账号取；取不到就只列当前值
+async function loadAccountLists() {
+  const editing = tpl, id = editing.account_id, tid = $('[data-select="tid"]');
+  $('#t-save').disabled = true; $('#t-err').hidden = true;
+  const current = editing.human_type2 || editing.tid;
+  mountSelect(tid, [{ v: current, label: current ? `分区 ${current}` : '加载分区…' }], current);
+  try {
+    const data = await accountTypeOptions(id);
+    if (tpl !== editing || tpl.account_id !== id) return;
+    const modern = data.type_mode === 2, opts = [...(modern ? data.human : data.legacy)];
+    if (!opts.length) throw new Error('没有可用分区，请确认投稿账号后重试');
+    const field = modern ? 'human_type2' : 'tid';
+    if (!editing.id) {
+      if (!opts.some(o => o.v === editing[field])) editing[field] = opts[0].v;
+      if (modern) editing.tid = 0; else editing.human_type2 = null;
+    }
+    let value = editing[field] || null;
+    if (modern && !editing.human_type2) {
+      const old = data.legacy.find(o => o.v === editing.tid);
+      opts.unshift({ v: null, label: `${old?.label || `分区 ${editing.tid}`}（旧分区，保留）`, sub: old?.sub });
+    } else if (!modern && editing.human_type2) {
+      value = 'human';
+      opts.unshift({ v: value, label: `新版分区 ${editing.human_type2}（保留）` });
+    } else if (!opts.some(o => o.v === value)) opts.unshift({ v: value, label: `分区 ${value}` });
+    mountSelect(tid, opts, value, v => {
+      if (v === 'human') return;
+      editing[field] = v;
+      if (!modern) editing.human_type2 = null;
+    });
+    $('#t-save').disabled = false;
+  } catch (e) {
+    if (tpl !== editing || tpl.account_id !== id) return;
+    mountSelect(tid, [{ v: current, label: current ? `分区 ${current}` : '分区加载失败' }], current);
+    $('#t-save').disabled = !editing.id;
+    fail($('#t-err'), e);
+  }
+}
+
+function openTemplate(id) {
+  const t = templates.find(t => String(t.id) === id);
+  tpl = t ? structuredClone(t) : { id: 0, name: '', account_id: accounts[0]?.id, title: '{name} {title} %Y-%m-%d', desc: '', tid: null, human_type2: null, tag: '', copyright: 2, source: '{url}', is_only_self: false, no_disturbance: false };
+  $('#tpl-h1').textContent = tpl.name || '新建模板';
+  $('#t-name').value = tpl.name; tTitle.value = tpl.title; $('#t-desc').value = tpl.desc; $('#t-source').value = tpl.source;
+  tags = splitTags(tpl.tag); renderTags($('#t-tags'), tags);
+  setCopyright(tpl.copyright);
+  $('#t-self').setAttribute('aria-checked', tpl.is_only_self);
+  $('#t-quiet').setAttribute('aria-checked', tpl.no_disturbance);
+  $('#t-delete').hidden = !t; $('#t-err').hidden = true;
+  mountSelect($('[data-select="acc"]'), accounts.map(a => ({ v: a.id, label: a.name, sub: 'uid ' + a.mid })), tpl.account_id, v => { tpl.account_id = v; loadAccountLists(); });
+  loadAccountLists(); renderTitle();
+}
+$('#t-save').onclick = async () => {
+  Object.assign(tpl, { name: $('#t-name').value, title: tTitle.value, desc: $('#t-desc').value, source: $('#t-source').value, tag: tags.join(',') });
+  try {
+    if (tpl.id) await api('PUT', `/api/templates/${tpl.id}`, tpl);
+    else await api('POST', '/api/templates', tpl);
+    templates = await api('GET', '/api/templates');
+    location.hash = '#templates';
+  } catch (e) { fail($('#t-err'), e); }
+};
+$('#t-delete').onclick = async e => {
+  if (!armed(e.currentTarget)) return;
+  try {
+    await api('DELETE', `/api/templates/${tpl.id}`);
+    templates = await api('GET', '/api/templates');
+    location.hash = '#templates';
+  } catch (e) { fail($('#t-err'), e); }
+};
+
+// —— 账号与扫码 ——
+let aopen = null;
+function renderAccounts() {
+  $('#accounts').innerHTML = accounts.map(a => {
+    const n = templates.filter(t => t.account_id === a.id).length;
+    return `<li style="border-bottom:1px solid var(--border)"><div class="lrow">
+    <span class="t">${esc(a.name)}</span>
+    <span class="r">${n ? `${n} 个模板在用` : '没有模板在用'}<br><button class="btn-ghost" type="button" data-acc="${a.id}" data-acc-act="edit" aria-expanded="${aopen === a.id}">修改名称</button> <button class="danger" type="button" data-danger="确认移除？" data-acc="${a.id}" data-acc-act="remove">移除</button></span>
+    <span class="s mono">uid ${a.mid}<span class="err" hidden></span></span></div>
+    ${aopen === a.id ? `<form class="editor" data-acc-form="${a.id}">
+      <div class="field"><label for="a-name-${a.id}">账号名称</label><input class="field-box" id="a-name-${a.id}" value="${esc(a.name)}" required></div>
+      <div class="form-foot"><button class="btn" type="submit">保存</button><button class="btn-ghost" type="button" data-acc="${a.id}" data-acc-act="cancel">取消</button><span class="err" hidden></span></div>
+    </form>` : ''}</li>`;
+  }).join('') || '<li class="empty">还没有账号，扫码添加一个。</li>';
+}
+$('#accounts').onclick = async e => {
+  const b = e.target.closest('[data-acc]');
+  if (!b) return;
+  if (b.dataset.accAct === 'edit' || b.dataset.accAct === 'cancel') {
+    aopen = b.dataset.accAct === 'edit' ? +b.dataset.acc : null;
+    renderAccounts();
+    if (aopen != null) $(`#a-name-${aopen}`).focus();
+    return;
+  }
+  if (!armed(b)) return;
+  try { await api('DELETE', `/api/accounts/${b.dataset.acc}`); accounts = await api('GET', '/api/accounts'); renderAccounts(); }
+  catch (err) { fail($('.err', b.closest('.lrow')), err); }
+};
+$('#accounts').onsubmit = async e => {
+  e.preventDefault();
+  const form = e.target;
+  try {
+    await api('PUT', `/api/accounts/${form.dataset.accForm}`, { name: $('input', form).value.trim() });
+    accounts = await api('GET', '/api/accounts'); aopen = null; renderAccounts();
+  } catch (err) { fail($('.err', form), err); }
+};
+
+let qrRun = 0;  // 每次获取二维码加一，旧的轮询看到就停
+const QR_TEXT = { waiting: ['等待扫码', '用 B 站手机客户端扫一扫，二维码 3 分钟内有效。'], scanned: ['已扫码', '请在手机上点「确认登录」。'], expired: ['二维码已过期', '重新获取一个再扫。'], failed: ['登录失败', ''] };
+function qrState(state, svg, sub) {
+  const [title, text] = QR_TEXT[state];
+  $('#qr').innerHTML = `<div class="qr-box ${state === 'expired' || state === 'failed' ? 'dim' : ''}"><div class="qr" aria-label="登录二维码">${svg}</div><div>
+    <p class="state">${title}</p><p class="sub">${esc(sub || text)}</p>
+    <div class="acts">${state === 'expired' || state === 'failed' ? '<button class="btn" type="button" data-qr="retry">重新获取</button>' : ''}<button class="btn-ghost" type="button" data-qr="cancel">取消</button></div></div></div>`;
+}
+async function startQR() {
+  const run = ++qrRun;
+  $('#qr').hidden = false;
+  try {
+    const { login_id, svg } = await api('POST', '/api/accounts/login');
+    qrState('waiting', svg);
+    while (run === qrRun) {
+      await new Promise(r => setTimeout(r, 2000));
+      if (run !== qrRun) return;
+      const s = await api('GET', `/api/accounts/login/${login_id}`);
+      if (run !== qrRun) return;
+      if (s.state === 'done') {
+        accounts = await api('GET', '/api/accounts');
+        $('#qr').hidden = true; renderAccounts();
+        [...document.querySelectorAll('#accounts [data-acc]')].find(b => +b.dataset.acc === s.account_id)?.closest('.lrow').classList.add('flash');
+        return;
+      }
+      qrState(s.state, svg, s.error);
+      if (s.state !== 'waiting' && s.state !== 'scanned') return;
+    }
+  } catch (e) { if (!(e instanceof Unauth) && run === qrRun) qrState('failed', '', e.message); }
+}
+$('#add-acc').onclick = startQR;
+$('#qr').onclick = e => { const b = e.target.closest('[data-qr]'); if (!b) return; if (b.dataset.qr === 'retry') startQR(); else { qrRun++; $('#qr').hidden = true; } };
+
+// —— 登录 ——
+function logout(msg) {
+  authed = false; qrRun++;
+  document.body.classList.add('out');
+  route();
+  $('#l-err').hidden = !msg; $('#l-err').textContent = msg || '';
+}
+$('#login-form').onsubmit = async e => {
+  e.preventDefault();
+  const res = await fetch('/api/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: $('#l-pw').value }) }).catch(() => null);
+  if (res?.ok) { $('#l-pw').value = ''; return boot(); }
+  fail($('#l-err'), new Error(!res ? '连不上总控' : res.status === 401 ? '密码不对' : res.status === 403 ? '控制台没有启用：总控配置里没有 admin_password_hash。' : `登录失败（${res.status}）`));
+};
+$('#logout').onclick = async () => { await fetch('/api/logout', { method: 'POST' }).catch(() => {}); logout(); };
+
+// —— 视图切换 ——
+function route() {
+  let [v, arg] = location.hash.slice(1).split('/');
+  if (!authed) v = 'login';
+  else if (!document.querySelector(`[data-view="${v}"]`) || v === 'login') v = 'overview';
+  if (v === 'submits') renderSubmits();
+  if (v === 'template') openTemplate(arg);
+  if (v === 'templates') renderTemplates();
+  if (v === 'accounts') renderAccounts();
+  document.querySelectorAll('[data-view]').forEach(m => m.hidden = m.dataset.view !== v);
+  const nav = v === 'template' ? 'templates' : v;
+  document.querySelectorAll('[data-nav]').forEach(a => a.dataset.nav === nav ? a.setAttribute('aria-current', 'page') : a.removeAttribute('aria-current'));
+  if (v === 'login') $('#l-pw').focus();
+  window.scrollTo(0, 0);
+}
+addEventListener('hashchange', route);
+const nav = $('nav');
+// 用哨兵判断是否离开顶部：不依赖 scroll 事件
+new IntersectionObserver(([e]) => nav.classList.toggle('stuck', !e.isIntersecting)).observe($('#nav-sentinel'));
+
+async function boot() {
+  try {
+    [templates, accounts] = await Promise.all([api('GET', '/api/templates'), api('GET', '/api/accounts')]);
+    authed = true;
+    document.body.classList.remove('out');
+    await refresh();
+    prefetchSeasons();
+    route();
+  } catch (e) {
+    if (!(e instanceof Unauth)) logout(e.message);
+  }
+}
+boot();
+</script>
+</body>
+</html>

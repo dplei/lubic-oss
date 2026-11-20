@@ -1,0 +1,15 @@
+target
+.git
+.github
+.workflow
+.claude
+deploy
+*.flv
+*.ts
+*.part
+*.json
+*.db
+*.toml
+!Cargo.toml
+!crates/*/Cargo.toml
+target

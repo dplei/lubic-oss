@@ -1,0 +1,11 @@
+/target
+*.flv
+*.ts
+*.part
+# 凭证与运行状态一律放仓库外，这里兜底
+*.db
+*.db-*
+*.json
+# macOS Finder 生成的目录元数据
+.DS_Store
+__pycache__/

@@ -1,0 +1,13 @@
+[package]
+name = "lubic-proto"
+version = "0.1.0"
+edition = "2024"
+description = "Messages between lubic agents and the controller."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+lubic-events = { path = "../events" }
+serde = { version = "1.0", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1.0"

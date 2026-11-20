@@ -1,0 +1,47 @@
+[package]
+name = "lubic"
+version = "0.1.0"
+edition = "2024"
+description = "Minimal, stable live stream recorder distilled from biliup."
+license = "MIT OR Apache-2.0"
+
+[workspace]
+members = ["crates/events", "crates/upos", "crates/account", "crates/agent", "crates/proto", "crates/controller"]
+
+[dependencies]
+lubic-events = { path = "crates/events" }
+async-trait = "0.1"
+byteorder = "1.5"
+bytes = "1.10"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+flate2 = "1"
+humantime = "2.2"
+libsm = "0.6"
+m3u8-rs = "6"
+md-5 = "0.10"
+urlencoding = "2.1"
+nom = "8"
+rand = "0.8"
+regex = "1.11"
+reqwest = { version = "0.13.4", features = ["cookies", "form", "query", "charset", "http2", "brotli", "gzip", "json", "stream"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync", "net", "io-util"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "local-time"] }
+url = "2.5"
+tracing-appender = "0.2"
+
+[dev-dependencies]
+futures = "0.3"
+tokio = { version = "1", features = ["test-util"] }
+http = "1"
+tempfile = "3.14"
+
+[profile.release]
+lto = "thin"
+codegen-units = 16
+strip = true

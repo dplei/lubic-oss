@@ -1,0 +1,27 @@
+[package]
+name = "lubic-agent"
+version = "0.1.0"
+edition = "2024"
+description = "lubic agent: record the rooms the controller assigns, upload each part with controller-issued tickets."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+lubic = { path = "../.." }
+lubic-events = { path = "../events" }
+lubic-proto = { path = "../proto" }
+lubic-upos = { path = "../upos" }
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+reqwest = { version = "0.13.4", features = ["http2", "json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }
+tokio-util = "0.7"
+toml = "0.9"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3.14"
+tokio = { version = "1", features = ["test-util"] }

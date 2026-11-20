@@ -1,0 +1,19 @@
+[package]
+name = "lubic-upos"
+version = "0.1.0"
+edition = "2024"
+description = "Upload a local file to Bilibili UPOS with a pre-issued credential. Knows nothing about login."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+futures = "0.3"
+reqwest = { version = "0.13.4", features = ["json", "query", "http2"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "time", "sync", "macros"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3.14"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
