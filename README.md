@@ -193,6 +193,19 @@ let filename = lubic_upos::upload(&client, path, &ticket, &Default::default(), &
 cargo test --workspace
 ```
 
+## 赞助
+
+<p align="center">
+  lubic 是业余时间维护的项目，切段、交接、补传这些细节都是在真实直播里一场场踩坑改出来的。<br>
+  如果它帮你省下了守直播的时间，欢迎请我喝杯咖啡 ☕
+</p>
+
+<p align="center">
+  <a href="https://afdian.com/a/feedmycode"><img alt="爱发电：微信 / 支付宝" src="https://img.shields.io/badge/%E7%88%B1%E5%8F%91%E7%94%B5-%E5%BE%AE%E4%BF%A1%20%7C%20%E6%94%AF%E4%BB%98%E5%AE%9D-946CE6?style=for-the-badge"></a>
+  &nbsp;
+  <a href="https://ko-fi.com/dplay0216"><img alt="Ko-fi" src="https://img.shields.io/badge/Ko--fi-Worldwide-FF5E5B?style=for-the-badge&logo=kofi&logoColor=white"></a>
+</p>
+
 ## 致谢
 
 - [biliup](https://github.com/biliup/biliup)：录制与上传的思路来源。
