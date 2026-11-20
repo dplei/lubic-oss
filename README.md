@@ -41,7 +41,7 @@ lubic 从 [biliup](https://github.com/biliup/biliup) 提炼而来，目标是一
 
 ![控制台总览：房间录制状态与各机器的在传、受限、让出网络、离线状态](docs/demo/screenshot.png)
 
-[`docs/demo/index.html`](docs/demo/index.html) 是一个可交互的演示页：用真实的控制台页面加上虚构数据，不连总控，只能浏览、改动不会保存。下载后用浏览器直接打开即可；仓库开启 GitHub Pages 后也可以在线访问。演示页由 `tools/console-demo.sh docs/demo` 生成，数据定义在 `crates/controller/src/demo.rs`。
+[在线演示](https://dplei.github.io/lubic-oss/docs/demo/)：用真实的控制台页面加上虚构数据，不连总控，只能浏览、改动不会保存。演示页由 `tools/console-demo.sh docs/demo` 生成，数据定义在 `crates/controller/src/demo.rs`。
 
 ## 技术栈
 
@@ -199,4 +199,4 @@ cargo test --workspace
 
 ## 许可证
 
-代码以 [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE) 双许可发布。总控内嵌的思源黑体字体另按 SIL Open Font License 授权，见 [crates/controller/assets/fonts/OFL.txt](crates/controller/assets/fonts/OFL.txt)。
+代码以 [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE) 双许可发布。总控内嵌的思源黑体字体另按 SIL Open Font License 授权，见 [OFL.txt](crates/controller/assets/fonts/OFL.txt)。
