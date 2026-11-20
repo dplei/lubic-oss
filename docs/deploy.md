@@ -234,6 +234,58 @@ docker compose up -d caddy
 
 之后开播自动录制、边录边传，下播后自动投稿。房间、模板、账号、机器都在控制台里增删改，立即生效。
 
+## 5. 日常操作
+
+下面的 `lubic-controller ...` 在不同部署里这样跑：
+
+- Docker：`docker compose exec controller lubic-controller -c /data/controller.toml <子命令>`，在 compose 所在目录执行。
+- Mac：`~/.local/bin/lubic-controller -c "$HOME/Library/Application Support/lubic/controller.toml" <子命令>`。
+
+### 取回原片
+
+分P传上 B 站后本地就删了。总控签发上传凭证时会把它记进库里、保留 5 天，凭它能把传上去的**原始文件**整个下载回来（不是 B 站转码后的版本），适合稿件被退回要重新剪、或者想留一份本地备份。
+
+```bash
+lubic-controller ... upos '主播A 2026-11-01 13:04'   # 按 part_id 或录制路径的一段查
+```
+
+每个匹配的分P输出两行：`# <part_id> <字节数> bytes, ticket <N>h old`，和一条 `curl` 命令。在想存文件的机器上运行那条 `curl`，下完用 `ls -l` 核对字节数，和输出里的一致才算下全。
+
+- 只能取回 5 天内上传的分P，超过就查不到了。
+- `tx`、`bda2`、`alia` 线路能取回；`bldsa` 线路只给 HEAD，GET 一律 403。`agent.toml` 的 `line` 默认是 `tx`。
+- 命令里带凭证，别贴进 issue、群聊或会保留的日志。
+
+### 手动场末
+
+总控按下播宽限期判断一场结束。想让某个房间这一场立刻结束、分P传完就投稿：
+
+```bash
+lubic-controller ... end 主播A
+```
+
+总控运行中也能用。
+
+### 投稿结果未知
+
+投稿超时或总控在提交中途崩溃时，稿件在控制台显示「需人工」（库里的 `phase` 是 `attention`），lubic 不会自动重投，以免重复投稿。先到 B 站创作中心确认这份稿件到底投上没有：
+
+- **没投上，也不要了**：在控制台「投稿」里点「丢弃」。
+- **没投上，要重投**，或者**已经投上了**：要改库。先停总控（Docker：`docker compose stop controller`；停的时候 Agent 照常录，事件排队等总控回来），用主机上的 `sqlite3` 打开 `controller.db`，把这份稿件的 `phase` 改成 `'ended'`（重投）或 `'submitted'`（已投上），再启动总控：
+
+  ```sql
+  SELECT id, phase FROM archives WHERE phase = 'attention';
+  UPDATE archives SET phase = 'ended' WHERE id = <id>;
+  ```
+
+### 暂停房间
+
+在控制台取消这个房间的全部优先机器并保存。当前这一场录完后就不再录，已录的照常上传投稿。
+
+### 看日志
+
+- Docker：`docker compose logs --tail 200 controller`（或 `agent`），完整日志在 `controller/logs`、`agent/logs`。
+- Mac：`~/Library/Logs/lubic/`；进程起不来时看 `~/Library/Logs/lubic-*.stderr.log`。
+
 ## 附：只录不传
 
 只想把直播存到本地、不投稿时，不用总控和 Agent，单个命令行程序就够：
