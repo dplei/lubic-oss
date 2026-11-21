@@ -608,10 +608,13 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::{assign, config, db_room, seen, test_apps};
+    use crate::tests::{assign, capture_logs, config, db_room, seen, test_apps};
 
     const MIN: i64 = 60_000;
     const T: i64 = 100 * MIN;
+
+    /// 表驱动用例：(说明, 构造场景)。
+    type Case = (&'static str, fn(&App));
 
     /// 支持故障试拉的 agent 的心跳。
     fn capable() -> Status {
@@ -641,25 +644,8 @@ mod tests {
 
     /// 跑 `f`，返回期间的 `health.trial` 日志行。
     fn trial_logs(f: impl FnOnce()) -> Vec<String> {
-        #[derive(Clone, Default)]
-        struct Buf(Arc<Mutex<Vec<u8>>>);
-        impl std::io::Write for Buf {
-            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().write(b)
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let buf = Buf::default();
-        let writer = buf.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(move || writer.clone())
-            .with_ansi(false)
-            .finish();
-        tracing::subscriber::with_default(subscriber, f);
-        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
-        out.lines()
+        capture_logs(f)
+            .lines()
             .filter(|l| l.contains("health.trial"))
             .map(str::to_string)
             .collect()
@@ -712,7 +698,7 @@ mod tests {
     /// 整机隔离、停用、排空、停录、失联与不支持故障试拉的旧 agent 都不当候选。
     #[test]
     fn unavailable_machines_and_old_agents_are_never_candidates() {
-        let unfit: [(&str, fn(&App)); 6] = [
+        let unfit: [Case; 6] = [
             ("整机隔离", |app| {
                 let l = db::Limit {
                     since: T,
@@ -941,7 +927,7 @@ mod tests {
         room.split_time = Some(7200);
         db::save_room(&app.db(), &room).unwrap();
         assert_ne!(db_room(&app, "r").task(), task);
-        assert_eq!(app.desired("a").unwrap(), [task.clone()]);
+        assert_eq!(app.desired("a").unwrap(), std::slice::from_ref(&task));
         assert!(app.desired("b").unwrap().is_empty(), "试拉不进 rooms");
 
         beat(&app, "b", &trialing("r", run(10, 6_000, 1.0)), T + 12_000);
@@ -1063,7 +1049,7 @@ mod tests {
     /// 取消（§4.5）：下播、撤销分配、换场、原机恢复、别的原因已在交接。候选机收到不含试拉的清单，不迁、不加限制。
     #[test]
     fn a_trial_is_cancelled_when_the_room_or_the_origin_changes() {
-        let cancels: [(&str, fn(&App)); 5] = [
+        let cancels: [Case; 5] = [
             ("recovered", |app| beat(app, "a", &capable(), T + 10_000)),
             ("assignment_changed", |app| {
                 db::unassign(&app.db(), "r").unwrap()
@@ -1102,7 +1088,7 @@ mod tests {
     /// 候选机失联、停录、被停用或进入排空：取消，本轮不再试这台，2 分钟后轮换下一台。
     #[test]
     fn a_lost_or_unfit_candidate_is_dropped_and_the_next_one_tried() {
-        let lost: [(&str, fn(&App)); 4] = [
+        let lost: [Case; 4] = [
             ("失联", |_| {}),
             ("停录", |app| {
                 let s = Status {

@@ -134,7 +134,7 @@ pub struct LiveStream {
     pub platform: String,
     pub stream_headers: HashMap<String, String>,
     pub suffix: String,
-    /// 平台实际选中的画质代码。
+    /// 平台实际选中的画质的显示名（如「超清」），由各平台插件按平台叫法生成。
     pub recording_quality: Option<String>,
     /// 标识「这一场直播」：同一场多次检测、跨进程重启都不变。多机接续录制时用它归并分段。
     pub live_session_key: Option<String>,

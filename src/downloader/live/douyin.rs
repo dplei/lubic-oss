@@ -355,7 +355,7 @@ impl DouyinLive {
         Ok(Some(room_info))
     }
 
-    /// 返回（流地址，实际画质代码）。
+    /// 返回（流地址，实际画质在本房间的显示名）。
     fn select_stream_url(&self, room_info: &Value) -> LiveResult<(String, String)> {
         let mut pull_data = room_info.pointer("/stream_url/live_core_sdk_data/pull_data");
         if self.double_screen
@@ -388,7 +388,7 @@ impl DouyinLive {
                 .filter(|url| !is_replay_url(url))
         {
             let url = normalize_stream_url(&url.replace("&only_audio=1", ""));
-            return Ok((url, "origin".to_string()));
+            return Ok((url, quality_name(pull_data, "origin")));
         }
 
         let available: Vec<&str> = stream_data.keys().map(String::as_str).collect();
@@ -402,7 +402,7 @@ impl DouyinLive {
             .filter(|url| !is_replay_url(url))
             .map(normalize_stream_url)
             .ok_or_else(|| LiveError::custom("抖音可用直播流为空"))?;
-        Ok((url, selected_quality.to_string()))
+        Ok((url, quality_name(pull_data, selected_quality)))
     }
 
     fn stream_headers(&self) -> HashMap<String, String> {
@@ -519,6 +519,30 @@ fn live_session_key_from_room(room_info: &Value) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|id| !id.is_empty())
         .map(ToString::to_string)
+}
+
+/// 画质代码在本房间的显示名。各房间档位叫法不同（同是 origin，有的房间叫「超清」，有的叫「原画」），
+/// 先取 `pull_data.options.qualities` 里同 `sdk_key` 的 `name`；没有（如 origin 不在列表里、
+/// Web 接口不给 options）再按常见叫法兜底。
+fn quality_name(pull_data: Option<&Value>, code: &str) -> String {
+    let named = pull_data
+        .and_then(|pull_data| pull_data.pointer("/options/qualities"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|quality| quality.get("sdk_key").and_then(Value::as_str) == Some(code))
+        .and_then(|quality| quality.get("name").and_then(Value::as_str))
+        .filter(|name| !name.is_empty());
+    let name = named.unwrap_or(match code {
+        "origin" => "原画",
+        "uhd" => "蓝光",
+        "hd" => "超清",
+        "sd" => "高清",
+        "ld" => "标清",
+        "md" => "流畅",
+        other => other,
+    });
+    name.to_string()
 }
 
 /// 在 available 列表中，按 origin>uhd>hd>sd>ld>md 的优先级为 requested 选一档可用画质：
@@ -894,7 +918,37 @@ impl BrowserFingerprintGenerator {
 
 #[cfg(test)]
 mod quality_tests {
-    use super::select_quality_code;
+    use super::{quality_name, select_quality_code};
+    use serde_json::json;
+
+    #[test]
+    fn quality_name_comes_from_the_room_options() {
+        // 房间甲：origin 在 qualities 里叫「超清」。
+        let room_a = json!({"options": {"qualities": [
+            {"name": "标清", "sdk_key": "ld", "level": 1, "resolution": "960x540"},
+            {"name": "高清", "sdk_key": "sd", "level": 2, "resolution": "1280x720"},
+            {"name": "超清", "sdk_key": "origin", "level": 3, "resolution": ""}
+        ]}});
+        assert_eq!(quality_name(Some(&room_a), "origin"), "超清");
+        assert_eq!(quality_name(Some(&room_a), "sd"), "高清");
+        // 房间乙：qualities 里没有 origin，按兜底叫「原画」。
+        let room_b = json!({"options": {"qualities": [
+            {"name": "标清", "sdk_key": "ld"},
+            {"name": "高清", "sdk_key": "sd"},
+            {"name": "超清", "sdk_key": "hd"},
+            {"name": "蓝光", "sdk_key": "uhd"}
+        ]}});
+        assert_eq!(quality_name(Some(&room_b), "origin"), "原画");
+        assert_eq!(quality_name(Some(&room_b), "uhd"), "蓝光");
+    }
+
+    #[test]
+    fn quality_name_falls_back_without_options() {
+        let no_options = json!({"stream_data": "{}"});
+        assert_eq!(quality_name(Some(&no_options), "origin"), "原画");
+        assert_eq!(quality_name(Some(&no_options), "hd"), "超清");
+        assert_eq!(quality_name(None, "md"), "流畅");
+    }
 
     #[test]
     fn requested_available_returns_itself() {

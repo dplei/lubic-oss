@@ -350,7 +350,16 @@ async fn record_once(
 
     let download = async {
         if matches!(media_ext_from_url(url).as_deref(), Some("m3u8" | "ts")) {
-            return hls_download(url, &client, file("ts"), segment, &productive, pace, progress).await;
+            return hls_download(
+                url,
+                &client,
+                file("ts"),
+                segment,
+                &productive,
+                pace,
+                progress,
+            )
+            .await;
         }
         client
             .headers
@@ -367,7 +376,16 @@ async fn record_once(
                 room = stream.name,
                 "response is not FLV, falling back to HLS"
             );
-            return hls_download(url, &client, file("ts"), segment, &productive, pace, progress).await;
+            return hls_download(
+                url,
+                &client,
+                file("ts"),
+                segment,
+                &productive,
+                pace,
+                progress,
+            )
+            .await;
         }
         started.store(true, Ordering::Relaxed);
         if let Some(pace) = pace {
@@ -688,7 +706,8 @@ mod tests {
             let server = tokio::spawn(async move {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut request = [0; 4_096];
-                socket.read(&mut request).await.unwrap();
+                // 只为读掉请求，读到多少字节不用。
+                let _ = socket.read(&mut request).await.unwrap();
                 let length = body.len() + usize::from(reset);
                 socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
                 socket.write_all(&body).await.unwrap();
@@ -711,7 +730,13 @@ mod tests {
             let mut progress = httpflv::FlvProgress::default();
             let productive = tokio::time::timeout(
                 Duration::from_secs(5),
-                record_once(&stream, "s", &config, &CancellationToken::new(), &mut progress),
+                record_once(
+                    &stream,
+                    "s",
+                    &config,
+                    &CancellationToken::new(),
+                    &mut progress,
+                ),
             )
             .await
             .unwrap();
@@ -1096,7 +1121,10 @@ mod tests {
         tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let _ = socket.read(&mut [0; 4_096]).await;
-            let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len() + 1);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                body.len() + 1
+            );
             socket.write_all(head.as_bytes()).await.unwrap();
             socket.write_all(&body[..half]).await.unwrap();
             let _ = wait_more.await;
@@ -1766,7 +1794,11 @@ mod tests {
         assert!(!discard_if_header_only(&with_video, "flv", reason));
         assert!(discard_if_header_only(&one_video_frame, "flv", reason));
         assert!(!discard_if_header_only(&audio_only, "flv", reason));
-        assert!(discard_if_header_only(&audio_frame_after_avc_header, "flv", reason));
+        assert!(discard_if_header_only(
+            &audio_frame_after_avc_header,
+            "flv",
+            reason
+        ));
         assert!(discard_if_header_only(&short_video, "flv", reason));
         assert!(discard_if_header_only(&short_audio, "flv", reason));
         // 半个媒体 tag：tag 头与正文前两字节在，算有媒体。

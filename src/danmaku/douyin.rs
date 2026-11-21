@@ -508,6 +508,8 @@ mod tests {
     }
 
     #[test]
+    // 时间戳按「秒_毫秒」分组书写，故意不按三位一组。
+    #[allow(clippy::inconsistent_digit_grouping)]
     fn history_is_skipped_and_new_chats_are_returned() {
         let mut poller = Poller::new();
         let body1 = encode_response(
@@ -660,6 +662,8 @@ mod tests {
     }
 
     #[test]
+    // 时间戳按「秒_毫秒」分组书写，故意不按三位一组。
+    #[allow(clippy::inconsistent_digit_grouping)]
     fn bad_message_is_skipped() {
         let mut poller = Poller::new();
         let init = encode_response(&[], "c0", Some(1000), "");

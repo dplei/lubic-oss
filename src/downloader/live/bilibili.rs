@@ -119,7 +119,7 @@ impl BilibiliLive {
                 raw_stream_url,
                 platform: "bilibili".to_string(),
                 stream_headers: self.stream_headers(),
-                recording_quality: Some(selected_qn.to_string()),
+                recording_quality: Some(qn_name(selected_qn)),
                 // B 站 room_id 跨场不变，场次需配合开播时刻区分。
                 live_session_key: Some(format!("{}-{}", profile.room_id, profile.live_start_time)),
             }),
@@ -546,6 +546,22 @@ impl BilibiliLive {
     }
 }
 
+/// qn 的显示名，与 B 站播放器的叫法一致；不认识的 qn 原样给数字。
+fn qn_name(qn: u32) -> String {
+    match qn {
+        30000 => "杜比",
+        20000 => "4K",
+        25000 => "原画真彩",
+        10000 => "原画",
+        400 => "蓝光",
+        250 => "超清",
+        150 => "高清",
+        80 => "流畅",
+        _ => return qn.to_string(),
+    }
+    .to_string()
+}
+
 struct BiliRoomProfile {
     room_id: u64,
     uid: u64,
@@ -680,6 +696,14 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
+
+    #[test]
+    fn qn_turns_into_its_display_name() {
+        assert_eq!(qn_name(10000), "原画");
+        assert_eq!(qn_name(25000), "原画真彩");
+        assert_eq!(qn_name(80), "流畅");
+        assert_eq!(qn_name(12345), "12345");
+    }
 
     #[tokio::test]
     async fn select_stream_url_preserves_selected_qn() {

@@ -70,6 +70,7 @@ fn ended(room: &str, session: &str, at: i64) -> AgentEvent {
 
 /// 一场直播：`parts` 个一小时的分P，从 `start` 开始；`live` 为真时最后一个还在录，否则这一场已下播。
 /// `uploaded` 是前几个已传完。
+#[allow(clippy::too_many_arguments)]
 fn session(
     app: &App,
     agent: &str,

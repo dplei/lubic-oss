@@ -847,10 +847,9 @@ pub(crate) async fn parse_flv(
                 )?;
                 if let (Some(offset), Some((first, last))) =
                     (live_offset, state.written)
+                    && let Some(pace) = segment.pace()
                 {
-                    if let Some(pace) = segment.pace() {
-                        pace.written_live(first as i64 + offset, last as i64 + offset);
-                    }
+                    pace.written_live(first as i64 + offset, last as i64 + offset);
                 }
                 // 要求停止：上一个 GOP 已写完，在这个关键帧之前收尾。
                 if out.file.stopping() {
@@ -948,7 +947,8 @@ pub(crate) async fn parse_flv(
     }
     .await;
     progress.video_stalled = matches!(
-        &result, Err(crate::downloader::error::Error::HttpFlvVideoStalled { .. })
+        &result,
+        Err(crate::downloader::error::Error::HttpFlvVideoStalled { .. })
     );
     // 网络断开只丢未读完整的 tag；磁盘写失败时不能重试同一批，避免重复写出。
     let tail_result =
@@ -969,12 +969,10 @@ pub(crate) async fn parse_flv(
                 .map(|()| {
                     progress.tail_tags = tags;
                     progress.tail_bytes = bytes;
-                    if let (Some(offset), Some((first, last))) =
-                        (live_offset, state.written)
+                    if let (Some(offset), Some((first, last))) = (live_offset, state.written)
+                        && let Some(pace) = segment.pace()
                     {
-                        if let Some(pace) = segment.pace() {
-                            pace.written_live(first as i64 + offset, last as i64 + offset);
-                        }
+                        pace.written_live(first as i64 + offset, last as i64 + offset);
                     }
                 })
         } else {
@@ -982,8 +980,12 @@ pub(crate) async fn parse_flv(
         };
     if tail_result.is_ok() && !matches!(&result, Err(crate::downloader::error::Error::IOError(_))) {
         progress.discarded_tail_tags = Some(flv_tags_cache.len() as u64);
-        progress.discarded_tail_bytes = Some(flv_tags_cache.iter()
-            .map(|(h, _, _)| 11 + h.data_size as u64 + 4).sum());
+        progress.discarded_tail_bytes = Some(
+            flv_tags_cache
+                .iter()
+                .map(|(h, _, _)| 11 + h.data_size as u64 + 4)
+                .sum(),
+        );
     }
     if state.video_frames < 2 {
         progress.last_live_ms = None;
@@ -1212,7 +1214,9 @@ impl Connection {
                 self.buffer.advance(chunk_size);
                 return Ok(bytes);
             }
-            if let Some(stalled) = self.video_watch.as_ref()
+            if let Some(stalled) = self
+                .video_watch
+                .as_ref()
                 .and_then(|watch| watch.stalled_for(self.stall_timeout))
             {
                 return Err(crate::downloader::error::Error::HttpFlvVideoStalled {
@@ -1223,7 +1227,9 @@ impl Connection {
                 Ok(Ok(Some(chunk))) => {
                     self.received_bytes = self.received_bytes.saturating_add(chunk.len() as u64);
                     self.last_chunk_at = Instant::now();
-                    if !chunk.is_empty() && let Some(watch) = &mut self.video_watch {
+                    if !chunk.is_empty()
+                        && let Some(watch) = &mut self.video_watch
+                    {
                         watch.data();
                     }
                     if let Some(pace) = &self.pace {
@@ -1815,7 +1821,8 @@ mod tests {
     async fn cut_live_closes_before_the_matching_keyframe_and_ignores_streams_without_sei() {
         const LIVE0: i64 = 1_792_908_000_000;
         let captured = Captured::default();
-        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(captured.clone()));
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(captured.clone()));
         tracing::callsite::rebuild_interest_cache();
         let mut bytes = vec![b'F', b'L', b'V', 1, 5, 0, 0, 0, 9, 0, 0, 0, 0];
         append_tag(&mut bytes, 9, &[0x17, 0x00, 0, 0, 0, 0x01, 0x64, 0x00], 0);
@@ -1871,12 +1878,16 @@ mod tests {
             .collect();
         assert_eq!(media_ts, [50_000, 50_500, 51_000, 51_500]);
         assert!(!media_ts.contains(&52_000));
-        let events = captured.0.lock().unwrap();
-        let gap = events.iter().find(|e| e.get("event_name").map(String::as_str) == Some("recording.handoff_gap")).unwrap();
-        assert_eq!(gap["last_written_live_ms"], (LIVE0 + 51_500).to_string());
-        assert_eq!(gap["gap_ms"], "500");
-        assert_eq!(gap["content_overlap_ms"], "0");
-        drop(events);
+        {
+            let events = captured.0.lock().unwrap();
+            let gap = events
+                .iter()
+                .find(|e| e.get("event_name").map(String::as_str) == Some("recording.handoff_gap"))
+                .unwrap();
+            assert_eq!(gap["last_written_live_ms"], (LIVE0 + 51_500).to_string());
+            assert_eq!(gap["gap_ms"], "500");
+            assert_eq!(gap["content_overlap_ms"], "0");
+        }
 
         // 没有 SEI 的流：即使设了切点也不切，照常录到流尾。
         let no_sei_tpl = directory.path().join("no-sei").display().to_string();
@@ -2006,7 +2017,12 @@ mod tests {
         append_tag(&mut bytes, 8, &[0xaf, 0x00, 0x12, 0x10], 0);
         append_tag(&mut bytes, 9, &[0x17, 0x00, 0, 0, 0], 0);
         append_tag(&mut bytes, 8, &[0xaf, 0x01, 7, 7], 26_997);
-        append_tag(&mut bytes, 9, &[0x17, 0x00, 0, 0, 0, 0x01, 0x4d, 0x00], 27_011);
+        append_tag(
+            &mut bytes,
+            9,
+            &[0x17, 0x00, 0, 0, 0, 0x01, 0x4d, 0x00],
+            27_011,
+        );
         for index in 0..3u32 {
             let mut frame = vec![0x17, 0x01, 0, 0, 0];
             frame.resize(5 + 100, 0x41);
@@ -2265,7 +2281,7 @@ mod tests {
         fn a_source_gap_is_collapsed_and_keeps_av_skew() {
             const GAP: u32 = 19_000;
             let mut rebase = TimestampRebase::default();
-            let mut av = |rebase: &mut TimestampRebase, ts: u32| {
+            let av = |rebase: &mut TimestampRebase, ts: u32| {
                 let a = rebase.map(TagType::Audio, ts - 20).emit as i64;
                 let v = rebase.map(TagType::Video, ts).emit as i64;
                 (a, v)

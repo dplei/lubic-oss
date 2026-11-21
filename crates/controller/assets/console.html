@@ -583,10 +583,12 @@ function fmtAt(t) {
 }
 const platform = url => /bilibili\.com/.test(url) ? 'B站' : /douyin\.com/.test(url) ? '抖音' : (() => { try { return new URL(url).hostname; } catch { return ''; } })();
 const shown = r => r.display_name || r.name;
-// B 站 qn 与抖音画质代码的叫法
+// B 站 qn 与抖音画质代码的叫法；新版 agent 直接报显示名，这张表给旧版 agent 报的代码兜底
 const BILI_QN = [[30000, '杜比'], [20000, '4K'], [25000, '原画真彩'], [10000, '原画'], [400, '蓝光'], [250, '超清'], [150, '高清'], [80, '流畅']];
 const DOUYIN_Q = [['origin', '原画'], ['uhd', '蓝光'], ['hd', '超清'], ['sd', '高清'], ['ld', '标清'], ['md', '流畅']];
 const QUALITY = { ...Object.fromEntries(BILI_QN), ...Object.fromEntries(DOUYIN_Q) };
+// 抖音各房间档位叫法不同（同是 origin，有的房间叫超清），下拉按档位排序说
+const DOUYIN_TIER = [['origin', '最高'], ['uhd', '第 2 档'], ['hd', '第 3 档'], ['sd', '第 4 档'], ['ld', '第 5 档'], ['md', '最低']];
 const accName = id => accounts.find(a => a.id === id)?.name ?? `账号 ${id}`;
 const num = el => { const v = el.value.trim(); return v === '' ? null : Number(v); };
 
@@ -724,7 +726,7 @@ function editorLi() {
 function mountQuality(li) {
   const el = $('[data-select="room-qn"]', li), d = draft;
   if (platform($('#f-url', li)?.value ?? d.url) === '抖音')
-    mountSelect(el, [{ v: null, label: '默认', sub: '原画' }, ...DOUYIN_Q.map(([v, label]) => ({ v, label, sub: v }))], d.douyin_quality ?? null, v => d.douyin_quality = v);
+    mountSelect(el, [{ v: null, label: '默认', sub: '最高' }, ...DOUYIN_TIER.map(([v, label]) => ({ v, label, sub: v }))], d.douyin_quality ?? null, v => d.douyin_quality = v);
   else
     mountSelect(el, [{ v: null, label: '默认', sub: '原画真彩' }, ...BILI_QN.map(([v, label]) => ({ v, label, sub: String(v) }))], d.bili_qn ?? null, v => d.bili_qn = v);
 }

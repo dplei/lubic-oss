@@ -158,7 +158,7 @@ struct PaceInner {
     running: u32,
     /// 本条连接最近一次写盘时，写到的内容落后直播多少毫秒（按推流时刻算），以及那一刻。
     live_lag: Option<(i64, Instant)>,
-    /// 平台实际选中的画质代码（同 `LiveStream::recording_quality`）。
+    /// 平台实际选中的画质的显示名（同 `LiveStream::recording_quality`）。
     quality: Option<String>,
     /// 换机交接的切点（推流时刻 unix 毫秒）：旧机在推流时刻 ≥ 它的第一个关键帧前收尾。
     cut_live_ms: Option<i64>,

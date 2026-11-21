@@ -122,6 +122,7 @@ pub struct Status {
     /// 故障试拉的逐秒进度：(键 `trial:<房间名>`, [(采样于多久前（毫秒）, 累计媒体毫秒, 累计连接墙钟毫秒)])，
     /// 从试拉开始累计，只留最近 [`TRIAL_WINDOW`]，按时间先后排。总控据此按任意观察窗口算媒体推进与实时时长、
     /// 扣除连上时的首包突发；连接结束、视频写出、停滞、跳失、接缝照常在其余字段的同一个键下报。旧 agent 不报。
+    #[allow(clippy::type_complexity)]
     pub record_trial: Vec<(String, Vec<(u64, u64, u64)>)>,
     /// 最近 10 分钟本机写盘字节 / 墙钟。
     pub produce_bps: f64,

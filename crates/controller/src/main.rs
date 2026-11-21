@@ -823,7 +823,7 @@ impl App {
         let continue_failure_trial = cross_probe_candidate && limit.is_none();
         let failure_trial_candidate = (continue_failure_trial
             && status.is_some_and(|s| s.trial_support))
-        .then(|| match &room_limit {
+        .then_some(match &room_limit {
             Some(l) => TrialCandidate::RoomLimited { since: l.since },
             None => TrialCandidate::Unrestricted,
         });
@@ -3207,37 +3207,63 @@ pub mod tests {
         }
     }
 
-    /// 健康信号日志与总控其余日志一样用英文文案。
-    #[test]
-    fn health_signal_logs_are_in_english() {
-        #[derive(Clone, Default)]
-        struct Buf(Arc<Mutex<Vec<u8>>>);
-        impl std::io::Write for Buf {
+    /// 跑 `f`，返回期间本线程打出的日志。进程里只装一次全局 subscriber，按线程把日志写进缓冲区；
+    /// 不用 `with_default`：只剩一个 scoped dispatcher 时，别的线程首次触发同一日志点会走 tracing-core
+    /// 的 `JustOne` 分支，按它自己的空 subscriber 把 interest 全局缓存成 never，这边就收不到事件。
+    pub(crate) fn capture_logs(f: impl FnOnce()) -> String {
+        thread_local! {
+            static CAPTURE: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
+        }
+        struct Writer;
+        impl std::io::Write for Writer {
             fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().write(b)
+                CAPTURE.with_borrow_mut(|c| c.as_mut().map(|c| c.extend_from_slice(b)));
+                Ok(b.len())
             }
             fn flush(&mut self) -> std::io::Result<()> {
                 Ok(())
             }
         }
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(|| Writer)
+                .with_ansi(false)
+                .finish();
+            tracing::subscriber::set_global_default(subscriber).expect("测试进程里只装这一次");
+        });
+        CAPTURE.set(Some(Vec::new()));
+        f();
+        String::from_utf8(CAPTURE.take().unwrap()).unwrap()
+    }
+
+    /// 别的线程（并行的测试）先触发同一日志点时，抓日志也不能漏。
+    #[test]
+    fn logs_are_captured_after_another_thread_hits_the_callsite_first() {
+        fn emit() {
+            info!(event_name = "capture.probe", "capture probe");
+        }
+        let out = capture_logs(|| {
+            std::thread::spawn(emit).join().unwrap();
+            emit();
+        });
+        assert_eq!(out.matches("capture.probe").count(), 1, "{out}");
+    }
+
+    /// 健康信号日志与总控其余日志一样用英文文案。
+    #[test]
+    fn health_signal_logs_are_in_english() {
         let t = 100 * MIN;
         let (app, _) = test_app();
-        let buf = Buf::default();
-        let writer = buf.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(move || writer.clone())
-            .with_ansi(false)
-            .finish();
         let ago = |s: u64| s * 1000;
         let short = empty_connections(
             connections(&[("r", ago(5), 1), ("r", ago(6), 1), ("r", ago(7), 1)]),
             &[("r", ago(8), 1)],
         );
-        tracing::subscriber::with_default(subscriber, || {
+        let out = capture_logs(|| {
             app.health("a", &short, t);
             app.health("a", &Status::default(), t);
         });
-        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
         let lines: Vec<_> = out
             .lines()
             .filter(|l| l.contains("health.signal"))

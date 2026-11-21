@@ -1264,7 +1264,7 @@ mod tests {
         };
         assert_eq!(opened.path.parent(), Some(formal.as_path()));
         assert!(files_under(&c.trial_dir()).is_empty(), "暂存分段删掉");
-        assert_eq!(files_under(&formal), [opened.path.clone()]);
+        assert_eq!(files_under(&formal), std::slice::from_ref(&opened.path));
         // 正式分段录够 1 秒，停录时才会保留（`MIN_MEDIA_MS`）。
         tokio::time::sleep(Duration::from_millis(1_200)).await;
         reconcile(&mut running, &[], &rooms).await;

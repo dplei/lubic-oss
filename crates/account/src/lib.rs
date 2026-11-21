@@ -736,7 +736,8 @@ mod tests {
 
     #[test]
     fn studio_template_defaults_and_payload() {
-        let studio: Studio = serde_json::from_str(r#"{"title":"t","is_only_self":1,"no_disturbance":1}"#).unwrap();
+        let studio: Studio =
+            serde_json::from_str(r#"{"title":"t","is_only_self":1,"no_disturbance":1}"#).unwrap();
         assert_eq!((studio.tid, studio.copyright), (171, 1));
         let p = studio.payload();
         assert_eq!(p["is_only_self"], 1);
