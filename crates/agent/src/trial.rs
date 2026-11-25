@@ -163,6 +163,7 @@ mod tests {
             reason: CloseReason::Unknown,
             title: "t".into(),
             closed_at_ms: None,
+            source_url: None,
         }
     }
 
@@ -190,6 +191,7 @@ mod tests {
             path: staged("a.flv.part"),
             title: String::new(),
             tz_offset_secs: None,
+            source_url: None,
         };
         let pass = |e: Event| gate.inner.lock().unwrap().pass(e);
         pass(Event::PartOpened(opened.clone()));

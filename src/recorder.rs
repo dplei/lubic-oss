@@ -114,7 +114,8 @@ pub async fn watch_room(
         };
         match status {
             Ok(LiveStatus::Live { stream }) => {
-                next = record_session(plugin.as_ref(), *stream, &request, &config, &cancel).await;
+                next = record_session(plugin.as_ref(), *stream, &url, &request, &config, &cancel)
+                    .await;
                 // 停录、交接收尾、下播、换场：不再报平台在播（持续无有效视频只在确认在播时算）。
                 if let Some(pace) = &config.pace {
                     pace.unconfirm_live();
@@ -140,6 +141,7 @@ fn cut_done(config: &RecordConfig) -> bool {
 async fn record_session(
     plugin: &dyn LivePlugin,
     mut stream: LiveStream,
+    source_url: &str,
     request: &impl Fn() -> LiveRequest,
     config: &RecordConfig,
     cancel: &CancellationToken,
@@ -195,6 +197,7 @@ async fn record_session(
         let in_grace = offline.offline_since.is_some();
         let outcome = record_once_with_upgrade(
             &stream,
+            source_url,
             &session,
             config,
             cancel,
@@ -477,14 +480,23 @@ async fn record_once(
     progress: &mut httpflv::FlvProgress,
 ) -> bool {
     record_once_with_upgrade::<fn() -> LiveRequest>(
-        stream, session, config, cancel, progress, None, None,
+        stream,
+        &stream.url,
+        session,
+        config,
+        cancel,
+        progress,
+        None,
+        None,
     )
     .await
     .productive
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn record_once_with_upgrade<F: Fn() -> LiveRequest>(
     stream: &LiveStream,
+    source_url: &str,
     session: &str,
     config: &RecordConfig,
     cancel: &CancellationToken,
@@ -552,6 +564,7 @@ async fn record_once_with_upgrade<F: Fn() -> LiveRequest>(
         )
         .with_owner(owner.clone())
         .with_title(stream.title.clone())
+        .with_source_url((!source_url.is_empty()).then(|| source_url.to_string()))
         .with_tz_offset(config.tz_offset)
         .with_pace(config.pace.clone())
         .with_open_hook(move |event| {

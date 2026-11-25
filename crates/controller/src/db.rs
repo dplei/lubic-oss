@@ -246,6 +246,23 @@ ALTER TABLE parts ADD COLUMN tz_offset INTEGER;
 ALTER TABLE parts ADD COLUMN title TEXT NOT NULL DEFAULT '';
 ";
 
+/// 迁移 22（21 → 22）：一个逻辑房间可配置多个同平台直播间地址（按优先级存 JSON 数组，第一项同 `url` 为主房）；
+/// 稿件记下首个分P实际录制的直播间地址（`{url}` 固定用它，历史稿件为 NULL 时回退主房地址）。
+const MIGRATION_22: &str = "
+ALTER TABLE rooms ADD COLUMN urls TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE archives ADD COLUMN source_url TEXT;
+CREATE TABLE source_retirements (
+  room TEXT NOT NULL,
+  agent TEXT NOT NULL,
+  PRIMARY KEY (room, agent)
+);
+";
+
+/// 迁移 23（22 → 23）：接稿后仍能认出各分P原来所属的场次。
+const MIGRATION_23: &str = "
+ALTER TABLE parts ADD COLUMN session TEXT;
+";
+
 /// 房间文件名模板的默认值，同 biliup 生产上的 `filename_prefix`。与迁移 4 的列默认值一致。
 pub const DEFAULT_FILENAME: &str = "{streamer} %Y-%m-%d %H{colon}%M{colon}%S";
 
@@ -254,7 +271,7 @@ fn default_filename() -> String {
 }
 
 /// 迁移 1 之后的各步，第 i 个把 `user_version` 从 i + 1 升到 i + 2。
-const LATER: [&str; 20] = [
+const LATER: [&str; 22] = [
     MIGRATION_2,
     MIGRATION_3,
     MIGRATION_4,
@@ -275,6 +292,8 @@ const LATER: [&str; 20] = [
     MIGRATION_19,
     MIGRATION_20,
     MIGRATION_21,
+    MIGRATION_22,
+    MIGRATION_23,
 ];
 const VERSION: i64 = LATER.len() as i64 + 1;
 const MACHINES_VERSION: i64 = 9;
@@ -448,7 +467,12 @@ pub struct Import {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Room {
     pub name: String,
+    /// 主房地址（即 [`Self::urls`] 的第一项）；兼容旧接口与单地址配置。
+    #[serde(default)]
     pub url: String,
+    /// 按优先级排列的同平台直播间地址，第一项是主房。旧接口只传 `url` 时自动补齐。
+    #[serde(default)]
+    pub urls: Vec<String>,
     pub template_id: i64,
     /// 优先机器列表；空表示本场结束后暂停，重新选择后恢复。
     pub agents: Vec<String>,
@@ -488,11 +512,40 @@ pub struct Room {
     pub deleted: bool,
 }
 
+impl Room {
+    /// 按优先级排列的直播间地址（第一项为主房）；兼容只填 `url` 的旧数据。
+    pub fn sources(&self) -> Vec<&str> {
+        if !self.urls.is_empty() {
+            self.urls.iter().map(String::as_str).collect()
+        } else if !self.url.is_empty() {
+            vec![self.url.as_str()]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// 主房地址（即列表第一项）。
+    pub fn primary_url(&self) -> &str {
+        self.urls
+            .first()
+            .map(String::as_str)
+            .unwrap_or(self.url.as_str())
+    }
+}
+
 fn room_row(r: &Row) -> Result<Room> {
+    let url: String = r.get("url")?;
+    let urls_raw: String = r.get("urls")?;
+    let mut urls: Vec<String> = serde_json::from_str(&urls_raw).unwrap_or_default();
+    if urls.is_empty() && !url.is_empty() {
+        urls.push(url.clone());
+    }
+    let url = urls.first().cloned().unwrap_or(url);
     let agents: String = r.get("agents")?;
     Ok(Room {
         name: r.get("name")?,
-        url: r.get("url")?,
+        url,
+        urls,
         template_id: r.get("template_id")?,
         agents: serde_json::from_str(&agents).unwrap_or_default(),
         split_time: r.get("split_time")?,
@@ -523,18 +576,21 @@ pub fn room(conn: &Connection, name: &str) -> Result<Option<Room>> {
 
 /// 按名字新建或整行替换；已删除的同名房间就此复活。新建的排到最后。
 pub fn save_room(conn: &Connection, room: &Room) -> Result<()> {
+    let urls: Vec<&str> = room.sources();
+    let primary = urls.first().copied().unwrap_or(room.url.as_str());
     conn.execute(
-        "INSERT INTO rooms(name, url, template_id, agents, split_time, split_size_mb, grace,
+        "INSERT INTO rooms(name, url, urls, template_id, agents, split_time, split_size_mb, grace,
            bili_qn, tail_upload, display_name, filename, season_section_id, douyin_quality, tag, position)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
            (SELECT COALESCE(MAX(position), 0) + 1 FROM rooms))
-         ON CONFLICT(name) DO UPDATE SET url = ?2, template_id = ?3, agents = ?4,
-           split_time = ?5, split_size_mb = ?6, grace = ?7, bili_qn = ?8, tail_upload = ?9,
-           display_name = ?10, filename = ?11, season_section_id = ?12,
-           douyin_quality = ?13, tag = ?14, deleted = 0",
+         ON CONFLICT(name) DO UPDATE SET url = ?2, urls = ?3, template_id = ?4, agents = ?5,
+           split_time = ?6, split_size_mb = ?7, grace = ?8, bili_qn = ?9, tail_upload = ?10,
+           display_name = ?11, filename = ?12, season_section_id = ?13,
+           douyin_quality = ?14, tag = ?15, deleted = 0",
         params![
             room.name,
-            room.url,
+            primary,
+            serde_json::to_string(&urls).unwrap(),
             room.template_id,
             serde_json::to_string(&room.agents).unwrap(),
             room.split_time,
@@ -566,6 +622,7 @@ pub fn purge_rooms(conn: &Connection) -> Result<usize> {
     let n = conn.execute(
         "DELETE FROM rooms WHERE deleted = 1
            AND name NOT IN (SELECT room FROM assignments)
+           AND name NOT IN (SELECT room FROM source_retirements)
            AND name NOT IN (SELECT room FROM archives WHERE phase NOT IN (?1, ?2))",
         [SUBMITTED, DISCARDED],
     )?;
@@ -1140,6 +1197,60 @@ pub fn unassign(conn: &Connection, room: &str) -> Result<()> {
     delete_handoff(conn, room)
 }
 
+pub fn retiring(conn: &Connection, room: &str) -> Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM source_retirements WHERE room = ?1)",
+        [room],
+        |r| r.get(0),
+    )
+}
+
+pub fn retirements(conn: &Connection) -> Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare("SELECT room, agent FROM source_retirements")?;
+    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect()
+}
+
+pub fn begin_retirement(
+    conn: &Connection,
+    room: &str,
+    agents: &std::collections::HashSet<String>,
+    now: i64,
+) -> Result<()> {
+    unassign(conn, room)?;
+    for agent in agents {
+        conn.execute(
+            "INSERT INTO source_retirements(room, agent) VALUES (?1, ?2)",
+            params![room, agent],
+        )?;
+    }
+    finish_retirement(conn, room, now)?;
+    Ok(())
+}
+
+pub fn acknowledge_retirement(
+    conn: &Connection,
+    room: &str,
+    agent: &str,
+    now: i64,
+) -> Result<bool> {
+    let n = conn.execute(
+        "DELETE FROM source_retirements WHERE room = ?1 AND agent = ?2",
+        params![room, agent],
+    )?;
+    Ok(n > 0 && finish_retirement(conn, room, now)?)
+}
+
+fn finish_retirement(conn: &Connection, room: &str, now: i64) -> Result<bool> {
+    if retiring(conn, room)? {
+        return Ok(false);
+    }
+    for (id, _) in recording_archives(conn, room)? {
+        end_archive(conn, id, now)?;
+    }
+    Ok(true)
+}
+
 /// 这台 agent 该录的房间（分给它的，加上正交接给它的），按房间列表顺序，参数取分配时的快照。
 pub fn assigned_tasks(conn: &Connection, agent: &str) -> Result<Vec<RoomTask>> {
     let mut stmt = conn.prepare(
@@ -1453,8 +1564,8 @@ pub fn recording(conn: &Connection, room: &str) -> Result<bool> {
     )
 }
 
-/// 开播时刻、直播标题、各分P（按开录先后）。
-pub type Session = (i64, String, Vec<SessionPart>);
+/// 开播时刻、直播标题、稿件来源、各分P（按开录先后）。
+pub type Session = (i64, String, Option<String>, Vec<SessionPart>);
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SessionPart {
@@ -1470,12 +1581,12 @@ pub struct SessionPart {
 
 /// 房间这一场（最新一份没下播的稿件）。
 pub fn current_session(conn: &Connection, room: &str) -> Result<Option<Session>> {
-    let Some((id, started, title)) = conn
+    let Some((id, started, title, source_url)) = conn
         .query_row(
-            "SELECT id, started_at, title FROM archives WHERE room = ?1 AND phase = ?2
+            "SELECT id, started_at, title, source_url FROM archives WHERE room = ?1 AND phase = ?2
              ORDER BY id DESC LIMIT 1",
             params![room, RECORDING],
-            |r| Ok((r.get::<_, i64>(0)?, r.get(1)?, r.get(2)?)),
+            |r| Ok((r.get::<_, i64>(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )
         .optional()?
     else {
@@ -1497,7 +1608,7 @@ pub fn current_session(conn: &Connection, room: &str) -> Result<Option<Session>>
             })
         })?
         .collect::<Result<_>>()?;
-    Ok(Some((started, title, parts)))
+    Ok(Some((started, title, source_url, parts)))
 }
 
 /// 房间最近一场已结束直播的开录时刻（unix 毫秒）。
@@ -1531,23 +1642,52 @@ pub fn apply(conn: &Connection, agent: &str, event: &AgentEvent) -> Result<()> {
                     &p.title,
                     *at,
                     p.tz_offset_secs,
+                    p.source_url.as_deref(),
                 )?;
             }
             Event::PartClosed(p) => {
                 let opened = at - p.duration.as_millis() as i64;
                 part_seen(
-                    conn, agent, &p.owner, &p.part_id, &p.path, &p.title, opened, None,
+                    conn,
+                    agent,
+                    &p.owner,
+                    &p.part_id,
+                    &p.path,
+                    &p.title,
+                    opened,
+                    None,
+                    p.source_url.as_deref(),
                 )?;
-                conn.execute(
+                let updated = conn.execute(
                     "UPDATE parts SET state = 'closed', path = ?2, size = ?3, closed_at = ?4
                      WHERE part_id = ?1 AND state = 'open'",
                     params![p.part_id, p.path.to_string_lossy(), p.size as i64, at],
                 )?;
+                if updated > 0 {
+                    // 换源退场收尾时若 `end_archive` 先于 `PartClosed` 到达，补齐最新的 `hold_until`。
+                    conn.execute(
+                        &format!(
+                            "UPDATE archives SET hold_until = MAX(hold_until, {HOLD_UNTIL})
+                             WHERE id = (SELECT archive_id FROM parts WHERE part_id = ?1)
+                               AND phase = ?2 AND hold_until IS NOT NULL"
+                        ),
+                        params![p.part_id, ENDED],
+                    )?;
+                    join_late_source(conn, &p.part_id)?;
+                }
             }
             Event::PartDiscarded(p) => {
                 let opened = at - p.duration.as_millis() as i64;
                 part_seen(
-                    conn, agent, &p.owner, &p.part_id, &p.path, &p.title, opened, None,
+                    conn,
+                    agent,
+                    &p.owner,
+                    &p.part_id,
+                    &p.path,
+                    &p.title,
+                    opened,
+                    None,
+                    p.source_url.as_deref(),
                 )?;
                 conn.execute(
                     "UPDATE parts SET state = 'empty', size = ?2, closed_at = ?3
@@ -1635,6 +1775,7 @@ fn part_seen(
     title: &str,
     opened_at: i64,
     tz_offset: Option<i32>,
+    source_url: Option<&str>,
 ) -> Result<()> {
     let known: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM parts WHERE part_id = ?1)",
@@ -1646,10 +1787,13 @@ fn part_seen(
     }
     let archive: Option<i64> = conn
         .query_row(
-            "SELECT id FROM archives
-             WHERE room = ?1 AND session = ?2 AND phase IN (?3, ?4)
-               AND (ended_at IS NULL OR ended_at > ?5)
-             ORDER BY id DESC LIMIT 1",
+            "SELECT a.id FROM archives a
+             WHERE a.room = ?1 AND a.phase IN (?3, ?4)
+               AND (a.ended_at IS NULL OR a.ended_at > ?5)
+               AND (a.session = ?2 OR (?2 != '' AND a.started_at <= ?5 AND EXISTS (
+                 SELECT 1 FROM parts p WHERE p.archive_id = a.id AND p.session = ?2
+               )))
+             ORDER BY (a.session = ?2) DESC, a.id DESC LIMIT 1",
             params![owner.room, owner.session, RECORDING, ENDED, opened_at],
             |r| r.get(0),
         )
@@ -1670,20 +1814,31 @@ fn part_seen(
                     "part belongs to an archive already submitted, starting a new one"
                 );
             }
-            // 账号在开稿件时钉住：这一场的凭证和投稿都用它。
+            // 账号与实际录制的直播间地址在开稿件时（首个分P）钉住：
+            // 新 agent 直接在事件里带上 `source_url`；旧 agent 回退到当前分配快照里的地址。
+            let source_url = source_url
+                .filter(|u| !u.is_empty())
+                .map(str::to_string)
+                .or_else(|| {
+                    assigned_task(conn, &owner.room)
+                        .ok()
+                        .flatten()
+                        .map(|(_, task)| task.url)
+                });
             conn.execute(
-                "INSERT INTO archives(room, session, title, started_at, phase, account_id)
+                "INSERT INTO archives(room, session, title, started_at, phase, account_id, source_url)
                  VALUES (?1, ?2, ?3, ?4, ?5,
                    (SELECT t.account_id FROM rooms r JOIN templates t ON t.id = r.template_id
-                    WHERE r.name = ?1))",
-                params![owner.room, owner.session, title, opened_at, RECORDING],
+                    WHERE r.name = ?1),
+                   ?6)",
+                params![owner.room, owner.session, title, opened_at, RECORDING, source_url],
             )?;
             conn.last_insert_rowid()
         }
     };
     conn.execute(
-        "INSERT INTO parts(part_id, archive_id, agent, path, opened_at, state, tz_offset, title)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?7)",
+        "INSERT INTO parts(part_id, archive_id, agent, path, opened_at, state, tz_offset, title, session)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?7, ?8)",
         params![
             part_id,
             archive,
@@ -1692,20 +1847,65 @@ fn part_seen(
             opened_at,
             tz_offset,
             title,
+            owner.session,
         ],
     )?;
     Ok(())
 }
 
-/// 下播宽限内重新开录、但场次键变了（抖音断开重开会换 room_id，交接时两台也可能不同）：
-/// 找房间最近一份还没投、最后收尾距 `opened_at` 不超过宽限的稿件，改成新场次键并回录制中。
+/// 旧来源的事件晚到时，用真实的分P收尾时刻判断能否接到下一份稿件。
+fn join_late_source(conn: &Connection, part_id: &str) -> Result<()> {
+    let pair: Option<(i64, i64)> = conn
+        .query_row(
+            "SELECT old.id, next.id
+             FROM parts part JOIN archives old ON old.id = part.archive_id
+             JOIN rooms room ON room.name = old.room
+             JOIN archives next ON next.id = (
+                 SELECT id FROM archives
+                 WHERE room = old.room AND started_at > old.started_at
+                 ORDER BY started_at, id LIMIT 1
+             )
+             JOIN parts last ON last.archive_id = old.id AND last.closed_at = (
+                 SELECT MAX(closed_at) FROM parts WHERE archive_id = old.id
+             )
+             WHERE part.part_id = ?1 AND json_array_length(room.urls) > 1
+               AND old.session != next.session AND old.source_url != next.source_url
+               AND old.account_id IS next.account_id
+               AND (old.phase = ?2 OR (old.phase = ?3 AND old.hold_until IS NOT NULL))
+               AND (next.phase = ?2 OR (next.phase = ?3 AND next.hold_until IS NOT NULL))
+               AND next.started_at BETWEEN last.closed_at AND last.closed_at + COALESCE(room.grace, 300) * 1000",
+            params![part_id, RECORDING, ENDED],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    if let Some((old, next)) = pair {
+        conn.execute(
+            "UPDATE archives
+             SET (started_at, title, source_url) = (
+                 SELECT started_at, title, source_url FROM archives WHERE id = ?1
+             ) WHERE id = ?2",
+            params![old, next],
+        )?;
+        conn.execute(
+            "UPDATE parts SET archive_id = ?2 WHERE archive_id = ?1",
+            params![old, next],
+        )?;
+        conn.execute("DELETE FROM archives WHERE id = ?1", [old])?;
+        info!(old, next, "late parts joined the next source archive");
+    }
+    Ok(())
+}
+
+/// 下播宽限内重新开录、但场次键变了（抖音断开重开会换 room_id，交接或换房时两段也不同）：
+/// 找房间最近一份还没投、最后收尾距 `opened_at` 不超过宽限的稿件，改成新场次键并回录制中；
+/// 原稿件开稿时钉住的 `source_url` 保留不变。
 fn rejoin(conn: &Connection, owner: &Owner, opened_at: i64) -> Result<Option<i64>> {
     let id: Option<i64> = conn
         .query_row(
             &format!(
                 "SELECT id FROM archives
-                 WHERE room = ?1 AND session != ?2 AND started_at <= ?3
-                   AND ((phase = ?4 AND hold_until >= ?3) OR (phase = ?5 AND {HOLD_UNTIL} >= ?3))
+                 WHERE room = ?1 AND started_at <= ?3
+                   AND ((phase = ?4 AND hold_until >= ?3) OR (phase = ?5 AND session != ?2 AND {HOLD_UNTIL} >= ?3))
                  ORDER BY id DESC LIMIT 1"
             ),
             params![owner.room, owner.session, opened_at, ENDED, RECORDING],
@@ -1851,6 +2051,8 @@ pub struct Archive {
     pub room: String,
     /// 开稿件时钉住的账号；房间当时不在库里则为空。
     pub account_id: Option<i64>,
+    /// 稿件首个分P实际录制的直播间地址；历史稿件为空（投稿时回退房间主房地址）。
+    pub source_url: Option<String>,
     pub title: String,
     pub started_at: i64,
     /// 已上传的分P，按开录时刻排序。
@@ -1858,10 +2060,10 @@ pub struct Archive {
 }
 
 pub fn archive(conn: &Connection, id: i64) -> Result<Archive> {
-    let (room, title, started_at, account_id) = conn.query_row(
-        "SELECT room, title, started_at, account_id FROM archives WHERE id = ?1",
+    let (room, title, started_at, account_id, source_url) = conn.query_row(
+        "SELECT room, title, started_at, account_id, source_url FROM archives WHERE id = ?1",
         [id],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
     )?;
     let mut stmt = conn.prepare(
         "SELECT path, filename, opened_at, tz_offset, title FROM parts
@@ -1882,6 +2084,7 @@ pub fn archive(conn: &Connection, id: i64) -> Result<Archive> {
     Ok(Archive {
         room,
         account_id,
+        source_url,
         title,
         started_at,
         parts,
@@ -2157,6 +2360,7 @@ pub mod tests {
         let room = |name: &str, url: &str, agents: &[&str]| Room {
             name: name.into(),
             url: url.into(),
+            urls: vec![url.into()],
             template_id: 1,
             agents: agents.iter().map(|a| a.to_string()).collect(),
             split_time: None,
@@ -2202,6 +2406,7 @@ pub mod tests {
                 path: format!("/rec/{part}.flv.part").into(),
                 title: "直播".into(),
                 tz_offset_secs: Some(8 * 3600),
+                source_url: None,
             }),
             at,
         }
@@ -2218,6 +2423,7 @@ pub mod tests {
                 reason: CloseReason::TimedSplit,
                 title: "直播".into(),
                 closed_at_ms: None,
+                source_url: None,
             }),
             at,
         }
@@ -2485,7 +2691,7 @@ pub mod tests {
             &[opened("e1", "s", 20_000), discarded, ended("s", 30_000)],
         )
         .unwrap();
-        let (_, _, parts) = current_session(&conn, "r").unwrap().unwrap_or_default();
+        let (_, _, _, parts) = current_session(&conn, "r").unwrap().unwrap_or_default();
         assert!(parts.is_empty(), "session ended");
         let row: (String, Option<i64>, Option<i64>) = conn
             .query_row("SELECT state, size, closed_at FROM parts", [], |r| {
@@ -2636,6 +2842,7 @@ pub mod tests {
                 path: "/rec/p-tz.flv.part".into(),
                 title: "下半场标题".into(),
                 tz_offset_secs: Some(9 * 3600),
+                source_url: None,
             }),
             at: 2000,
         };
@@ -2653,5 +2860,163 @@ pub mod tests {
                 title: "下半场标题".into(),
             }]
         );
+    }
+
+    #[test]
+    fn late_parts_from_previous_source_join_within_grace() {
+        let old_url = "https://live.bilibili.com/6";
+        let new_url = "https://live.bilibili.com/60";
+        for gap in [299_999, 300_001] {
+            let conn = mem();
+            let mut r = room(&conn, "r").unwrap().unwrap();
+            r.urls = vec![old_url.into(), new_url.into()];
+            save_room(&conn, &r).unwrap();
+            let new_at = 20_010 + gap;
+            let mut first_new = opened("new", "new-session", new_at);
+            if let AgentEvent::Recorder {
+                event: Event::PartOpened(p),
+                ..
+            } = &mut first_new
+            {
+                p.source_url = Some(new_url.into());
+            }
+            apply(&conn, "b", &first_new).unwrap();
+            let mut first_old = opened("old", "old-session", 20_000);
+            if let AgentEvent::Recorder {
+                event: Event::PartOpened(p),
+                ..
+            } = &mut first_old
+            {
+                p.title = "旧来源标题".into();
+                p.source_url = Some(old_url.into());
+            }
+            apply(&conn, "a", &first_old).unwrap();
+            apply(&conn, "a", &closed("old", "old-session", 20_010)).unwrap();
+
+            if gap < 300_000 {
+                // 同一旧场次的下一条迟到事件不会把稿件的在录场次改回旧来源。
+                apply(&conn, "a", &opened("old-2", "old-session", 20_010)).unwrap();
+                apply(&conn, "a", &ended("old-session", 20_020)).unwrap();
+                assert_eq!(
+                    recording_archives(&conn, "r").unwrap(),
+                    [(1, "new-session".into())]
+                );
+                assert!(states(&conn).iter().all(|(_, id, _)| *id == 1));
+                let merged = archive(&conn, 1).unwrap();
+                assert_eq!(merged.source_url.as_deref(), Some(old_url));
+                assert_eq!(merged.started_at, 20_000);
+                assert_eq!(merged.title, "旧来源标题");
+            } else {
+                assert_eq!(
+                    states(&conn),
+                    [
+                        ("new".into(), 1, "open".into()),
+                        ("old".into(), 2, "closed".into())
+                    ]
+                );
+                assert_eq!(
+                    archive(&conn, 1).unwrap().source_url.as_deref(),
+                    Some(new_url)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn migration_22_preserves_single_url_and_pins_archive_source_url() {
+        // 从 v21 迁移到最新：旧单地址房间自动读成单项 urls，旧稿件 source_url 为 None。
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute_batch(MIGRATION_1).unwrap();
+        for sql in &LATER[..20] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 21i64).unwrap();
+        conn.execute_batch(
+            "INSERT INTO accounts VALUES (1, 'a', 1, '{}', 0);
+             INSERT INTO templates(id, name, account_id, title, \"desc\", tid, tag, copyright, source, is_only_self, no_disturbance)
+               VALUES (1, 't', 1, '{name}', '', 171, '', 1, '', 0, 0);
+             INSERT INTO rooms(name, url, template_id, agents, tail_upload, position)
+               VALUES ('r', 'https://live.bilibili.com/101', 1, '[]', 0, 1);
+             INSERT INTO archives(id, room, session, title, started_at, phase)
+               VALUES (1, 'r', 's0', '旧场', 1000, 'ended');",
+        )
+        .unwrap();
+
+        init(&mut conn, &[], || Ok(Import::default())).unwrap();
+        let r = room(&conn, "r").unwrap().unwrap();
+        assert_eq!(r.url, "https://live.bilibili.com/101");
+        assert_eq!(r.urls, ["https://live.bilibili.com/101"]);
+        assert_eq!(archive(&conn, 1).unwrap().source_url, None);
+
+        // 多来源与归档 source_url 固定：首分P在副房，宽限内换主房仍保留副房地址；宽限外开新稿件用新地址。
+        let conn2 = mem();
+        let u1 = "https://live.bilibili.com/6";
+        let u2 = "https://live.bilibili.com/60";
+        let open_src =
+            |part: &str, session: &str, at: i64, src: Option<&str>| AgentEvent::Recorder {
+                event: Event::PartOpened(PartOpened {
+                    owner: owner(session),
+                    part_id: part.into(),
+                    path: format!("/rec/{part}.flv.part").into(),
+                    title: "直播".into(),
+                    tz_offset_secs: Some(8 * 3600),
+                    source_url: src.map(str::to_string),
+                }),
+                at,
+            };
+        let close_src =
+            |part: &str, session: &str, at: i64, src: Option<&str>| AgentEvent::Recorder {
+                event: Event::PartClosed(PartClosed {
+                    owner: owner(session),
+                    part_id: part.into(),
+                    path: format!("/rec/{part}.flv").into(),
+                    duration: Duration::from_secs(60),
+                    size: 5,
+                    reason: CloseReason::TimedSplit,
+                    title: "直播".into(),
+                    closed_at_ms: None,
+                    source_url: src.map(str::to_string),
+                }),
+                at,
+            };
+
+        // 1) 首分P来自副房 u2；先 end_archive 再到 PartClosed 时也能按最新 closed_at 补齐 hold_until。
+        apply(&conn2, "a", &open_src("p1", "s-u2", 1_000, Some(u2))).unwrap();
+        assert!(end_archive(&conn2, 1, 100_000).unwrap());
+        apply(&conn2, "a", &close_src("p1", "s-u2", 400_000, Some(u2))).unwrap();
+        apply(&conn2, "a", &uploaded("p1")).unwrap();
+        // 宽限（默认 300s）内切到主房 u1（400_000 + 60_000 <= 400_000 + 300_000）：归并入稿件 1，source_url 保持 u2。
+        apply(&conn2, "a", &open_src("p2", "s-u1", 460_000, Some(u1))).unwrap();
+        apply(&conn2, "a", &close_src("p2", "s-u1", 520_000, Some(u1))).unwrap();
+        apply(&conn2, "a", &uploaded("p2")).unwrap();
+        apply(&conn2, "a", &ended("s-u1", 520_000)).unwrap();
+        let a1 = archive(&conn2, 1).unwrap();
+        assert_eq!(a1.parts.len(), 2);
+        assert_eq!(a1.source_url.as_deref(), Some(u2));
+
+        // 2) 宽限外开新来源（520_000 + 301_000）：新建稿件 2，旧 agent 不带 source_url 时回退当前分配快照地址。
+        let mut r2 = room(&conn2, "r").unwrap().unwrap();
+        r2.urls = vec![u1.into(), u2.into()];
+        let task_u1 = RoomTask {
+            name: "r".into(),
+            url: u1.into(),
+            split_time: None,
+            split_size_mb: None,
+            grace: None,
+            bili_qn: None,
+            douyin_quality: None,
+            filename: DEFAULT_FILENAME.into(),
+            streamer: "r".into(),
+            tail_upload: false,
+        };
+        assign(&conn2, "r", "a", "s-u1-next", 821_000, &task_u1).unwrap();
+        apply(&conn2, "a", &open_src("p3", "s-u1-next", 821_000, None)).unwrap();
+        apply(&conn2, "a", &close_src("p3", "s-u1-next", 881_000, None)).unwrap();
+        apply(&conn2, "a", &uploaded("p3")).unwrap();
+        let a2 = archive(&conn2, 2).unwrap();
+        assert_eq!(a2.parts.len(), 1);
+        assert_eq!(a2.source_url.as_deref(), Some(u1));
     }
 }

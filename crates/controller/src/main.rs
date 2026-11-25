@@ -282,7 +282,11 @@ const PROBE_LEAD_MS: i64 = 3 * 60_000;
 struct TomlRoom {
     /// 房间名：文件名里的 `{name}`、投稿模板的 `{name}`。
     name: String,
+    #[serde(default)]
     url: String,
+    /// 可选：多个同平台直播间地址，按优先级排，第一项是主房。与 `url` 二选一或以 `urls` 为准。
+    #[serde(default)]
+    urls: Vec<String>,
     /// 优先机器列表，缺省用 `default_agents`。
     agents: Option<Vec<String>>,
     #[serde(default, deserialize_with = "opt_duration")]
@@ -302,10 +306,27 @@ struct TomlRoom {
 }
 
 impl TomlRoom {
+    fn normalized_urls(&self) -> Vec<String> {
+        let raw = if !self.urls.is_empty() {
+            self.urls.clone()
+        } else if !self.url.trim().is_empty() {
+            vec![self.url.clone()]
+        } else {
+            Vec::new()
+        };
+        raw.into_iter()
+            .map(|u| u.trim().to_string())
+            .filter(|u| !u.is_empty())
+            .collect()
+    }
+
     fn import(&self, default_agents: &[String]) -> (db::Room, Studio) {
+        let urls = self.normalized_urls();
+        let url = urls.first().cloned().unwrap_or_else(|| self.url.clone());
         let room = db::Room {
             name: self.name.clone(),
-            url: self.url.clone(),
+            url,
+            urls,
             template_id: 0,
             agents: self
                 .agents
@@ -334,10 +355,14 @@ impl db::Room {
     }
 
     fn task(&self) -> RoomTask {
+        self.task_for(self.primary_url())
+    }
+
+    fn task_for(&self, url: &str) -> RoomTask {
         let secs = |s: Option<u64>| s.map(Duration::from_secs);
         RoomTask {
             name: self.name.clone(),
-            url: self.url.clone(),
+            url: url.to_string(),
             // 边录边传在开录时就拿凭证，分段时长加收尾上传要撑在凭证有效期内。
             split_time: match (self.tail_upload, secs(self.split_time)) {
                 (true, t) => Some(t.map_or(TAIL_SPLIT_MAX, |t| t.min(TAIL_SPLIT_MAX))),
@@ -372,7 +397,31 @@ impl Config {
     fn parse(text: &str) -> Result<Self, String> {
         let config: Self = toml::from_str(text).map_err(|e| e.to_string())?;
         parse_timezone(&config.timezone)?;
+        let plugins = builtin_plugins();
         for room in &config.rooms {
+            let urls = room.normalized_urls();
+            if urls.is_empty() {
+                return Err(format!("room {}: needs at least one url", room.name));
+            }
+            let mut platform: Option<&'static str> = None;
+            for (i, u) in urls.iter().enumerate() {
+                if urls[..i].contains(u) {
+                    return Err(format!("room {}: duplicate url {u}", room.name));
+                }
+                let Some(p) = plugins.iter().find(|p| p.matches(u)) else {
+                    if room.urls.is_empty() {
+                        continue;
+                    }
+                    return Err(format!("room {}: unsupported live url {u}", room.name));
+                };
+                if platform.is_some_and(|first| p.name() != first) {
+                    return Err(format!(
+                        "room {}: urls must belong to the same platform",
+                        room.name
+                    ));
+                }
+                platform = Some(p.name());
+            }
             if room.tail_upload && room.split_size_mb.is_none() {
                 return Err(format!(
                     "room {}: tail_upload needs split_size_mb",
@@ -605,10 +654,33 @@ struct App {
     gates: Mutex<HashMap<i64, Gate>>,
     /// 稿件 id → 总控第一次看到它那一场已不在播的时刻（孤儿稿件兜底用）。只在内存里，重启后重新计时。
     stale: Mutex<HashMap<i64, i64>>,
+    /// 各 agent 最近一次 `/v1/watch` 上报的正在跑的房间名集合。用于确认旧任务完全退场。只在内存里。
+    agent_rooms: Mutex<HashMap<String, std::collections::HashSet<String>>>,
     /// 本程序的提交号（[`lubic_proto::COMMIT`]）；测试里改它。
     commit: String,
     /// 收到停止信号：检测周期不再认领新投稿，进行中的那次返回后退出。
     stop: tokio::sync::watch::Sender<bool>,
+}
+
+/// 单个直播间地址的检测结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SourceStatus {
+    Live(String),
+    Offline,
+    Error,
+}
+
+/// 一个逻辑房间的检测结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RoomLive {
+    /// 确认在播：(选中的来源地址, 平台场次键)。
+    Live { url: String, session: String },
+    /// 确认不在播（未开录时所有来源均离线；录制中当前来源离线且未找到其他在播来源）。
+    Offline,
+    /// 当前在录来源确认下播，且已找到另一确认在播的来源（先收尾旧任务，退场后再开新来源）。
+    Switch { from_url: String, to_url: String },
+    /// 检测报错（未开录时有报错且无确认在播来源；录制中当前来源检测报错）。
+    Error,
 }
 
 /// 一个房间最近一次因录制信号被迁走，见 [`App::cross_check`]。
@@ -893,16 +965,52 @@ impl App {
 
     /// 按检测结果调整一个房间的分配，返回是否改了。
     /// `live`：`Some(Some(场次键))` 在播，`Some(None)` 不在播，`None` 检测失败（什么也不做）。
+    #[cfg(test)]
     fn schedule(
         &self,
         room: &db::Room,
         live: Option<Option<String>>,
         now: i64,
     ) -> db::Result<bool> {
+        let room_live = match live {
+            None => RoomLive::Error,
+            Some(None) => RoomLive::Offline,
+            Some(Some(session)) => {
+                let url = db::assigned_task(&self.db(), &room.name)?
+                    .map(|(_, t)| t.url)
+                    .unwrap_or_else(|| room.primary_url().to_string());
+                RoomLive::Live { url, session }
+            }
+        };
+        self.schedule_live(room, room_live, now)
+    }
+
+    /// 按多来源检测结果调整一个房间的分配，返回是否改了。
+    fn schedule_live(&self, room: &db::Room, live: RoomLive, now: i64) -> db::Result<bool> {
         let current = db::assignment(&self.db(), &room.name)?;
         match live {
-            None => Ok(false),
-            Some(Some(session)) => {
+            RoomLive::Error => Ok(false),
+            RoomLive::Switch { from_url, to_url } => {
+                let Some((agent, _)) = current else {
+                    return Ok(false);
+                };
+                let waiting = self.begin_retirement(&room.name, Some(&agent), now)?;
+                self.tried.lock().unwrap().remove(&room.name);
+                self.trials.lock().unwrap().remove(&room.name);
+                self.trial_drops.lock().unwrap().remove(&room.name);
+                if waiting.is_empty() {
+                    self.tick_now.notify_one();
+                }
+                info!(
+                    room = room.name,
+                    from = from_url,
+                    to = to_url,
+                    ?waiting,
+                    "switching recording source"
+                );
+                Ok(true)
+            }
+            RoomLive::Live { url, session } => {
                 // 交接在心跳里完成时用分配里的场次（见 `finish_handoffs_from`），所以随检测更新。
                 if current.is_some() {
                     db::set_assignment_session(&self.db(), &room.name, &session)?;
@@ -916,7 +1024,7 @@ impl App {
                     if let Some(h) = handoff
                         && self.online(&h.to, now, false)?.is_some()
                     {
-                        self.assign(room, &h.to, &session, now)?;
+                        self.assign(room, &h.to, &url, &session, now)?;
                         warn!(
                             room = room.name,
                             from = agent,
@@ -931,7 +1039,7 @@ impl App {
                     if let Some(t) = trial
                         && self.online(&t.to, now, false)?.is_some()
                     {
-                        self.assign(room, &t.to, &session, now)?;
+                        self.assign(room, &t.to, &url, &session, now)?;
                         warn!(
                             room = room.name,
                             from = agent,
@@ -949,6 +1057,15 @@ impl App {
                 {
                     return Ok(false);
                 }
+                // 未分配但仍有旧任务在退场中的在线 agent：先等它确认停掉旧任务，再开新来源，
+                // 避免同一个逻辑房间同时两路正式录制或旧机在退场期间重开另一来源。
+                if current.is_none()
+                    && (self.is_retiring(&room.name)?
+                        || (room.sources().len() > 1
+                            && !self.begin_retirement(&room.name, None, now)?.is_empty()))
+                {
+                    return Ok(false);
+                }
                 let exclude: Vec<&str> = current.iter().map(|(a, _)| a.as_str()).collect();
                 // 全部候选都受限时仍分给受限机：录总比不录好（handoff.md 取舍 2）。排空中的同理，
                 // 宁可推迟更新也不漏录，且排在受限机之前（它录得好好的，只是等着更新）。
@@ -957,7 +1074,7 @@ impl App {
                     warn!(room = room.name, candidates = ?room.agents, "live but no agent available");
                     return Ok(false);
                 };
-                self.assign(room, &name, &session, now)?;
+                self.assign(room, &name, &url, &session, now)?;
                 // 待验证的机器开录即解除：录制本身就是验证，再出问题走正常检测。
                 let pending = db::room_limit(&self.db(), &room.name, &name)?;
                 if pending.is_some_and(|l| now >= l.until) {
@@ -974,14 +1091,21 @@ impl App {
                             room = room.name,
                             from = old,
                             to = name,
+                            url,
                             "assigned agent unreachable, reassigned"
                         )
                     }
-                    None => info!(room = room.name, agent = name, session, "live, assigned"),
+                    None => info!(
+                        room = room.name,
+                        agent = name,
+                        url,
+                        session,
+                        "live, assigned"
+                    ),
                 }
                 Ok(true)
             }
-            Some(None) => {
+            RoomLive::Offline => {
                 // 下播且 agent 已报完这一场（宽限期满）才撤。刚分配的给 5 分钟，等 agent 报上第一个分段，
                 // 免得一次误判把正要开录的任务撤掉。
                 let Some((agent, assigned_at)) = current else {
@@ -996,6 +1120,81 @@ impl App {
                 Ok(true)
             }
         }
+    }
+
+    fn is_retiring(&self, room: &str) -> db::Result<bool> {
+        db::retiring(&self.db(), room)
+    }
+
+    fn agent_still_active(&self, conn: &Connection, agent: &str, now: i64) -> db::Result<bool> {
+        Ok(db::machine(conn, agent)?.is_some()
+            && self
+                .online_status(db::agent(conn, agent)?, now, true)
+                .is_some())
+    }
+
+    /// 和心跳按同一顺序加锁，避免在记下退场名单时漏掉已经收到的确认。
+    fn begin_retirement(
+        &self,
+        room: &str,
+        assigned: Option<&str>,
+        now: i64,
+    ) -> db::Result<std::collections::HashSet<String>> {
+        let agent_rooms = self.agent_rooms.lock().unwrap();
+        let mut conn = self.db();
+        let tx = conn.transaction()?;
+        let mut waiting = std::collections::HashSet::new();
+        for (agent, rooms) in &*agent_rooms {
+            if rooms.contains(room) && self.agent_still_active(&tx, agent, now)? {
+                waiting.insert(agent.clone());
+            }
+        }
+        if let Some(agent) = assigned {
+            if self.agent_still_active(&tx, agent, now)? {
+                waiting.insert(agent.to_string());
+            }
+            if let Some(h) = db::handoff(&tx, room)?
+                && self.agent_still_active(&tx, &h.to, now)?
+            {
+                waiting.insert(h.to);
+            }
+        }
+        if assigned.is_some() || !waiting.is_empty() {
+            db::begin_retirement(&tx, room, &waiting, now)?;
+        }
+        tx.commit()?;
+        Ok(waiting)
+    }
+
+    /// Agent 在完成本地停止后，会从下一次心跳的房间列表里移除该任务。
+    fn observe_watch(&self, agent: &str, rooms: &[String], now: i64) -> db::Result<()> {
+        let mut agent_rooms = self.agent_rooms.lock().unwrap();
+        let mut conn = self.db();
+        let tx = conn.transaction()?;
+        let mut finished = false;
+        for (room, waiting) in db::retirements(&tx)? {
+            if waiting == agent && !rooms.contains(&room) {
+                finished |= db::acknowledge_retirement(&tx, &room, agent, now)?;
+            }
+        }
+        tx.commit()?;
+        agent_rooms.insert(agent.to_string(), rooms.iter().cloned().collect());
+        if finished {
+            self.tick_now.notify_one();
+        }
+        Ok(())
+    }
+
+    /// 等待中的机器已失联或移除时，按现有失联机制放行。
+    fn settle_retiring(&self, now: i64) -> db::Result<()> {
+        let mut conn = self.db();
+        let tx = conn.transaction()?;
+        for (room, agent) in db::retirements(&tx)? {
+            if !self.agent_still_active(&tx, &agent, now)? {
+                db::acknowledge_retirement(&tx, &room, &agent, now)?;
+            }
+        }
+        tx.commit()
     }
 
     /// 开播先比档位，交接只挑可交接的机器。同档取负载（[`db::load`]）最小的，相等时取优先列表里靠前的。
@@ -1027,8 +1226,22 @@ impl App {
         Ok(best.map(|(_, name)| name.clone()))
     }
 
-    fn assign(&self, room: &db::Room, agent: &str, session: &str, now: i64) -> db::Result<()> {
-        db::assign(&self.db(), &room.name, agent, session, now, &room.task())?;
+    fn assign(
+        &self,
+        room: &db::Room,
+        agent: &str,
+        url: &str,
+        session: &str,
+        now: i64,
+    ) -> db::Result<()> {
+        db::assign(
+            &self.db(),
+            &room.name,
+            agent,
+            session,
+            now,
+            &room.task_for(url),
+        )?;
         self.tried.lock().unwrap().remove(&room.name);
         Ok(())
     }
@@ -1147,7 +1360,10 @@ impl App {
         if !caught_up && now - started < HANDOFF_MAX_WAIT_MS {
             return Ok(false);
         }
-        self.assign(room, &h.to, session, now)?;
+        let active_url = db::assigned_task(&self.db(), &room.name)?
+            .map(|(_, t)| t.url)
+            .unwrap_or_else(|| room.primary_url().to_string());
+        self.assign(room, &h.to, &active_url, session, now)?;
         info!(
             room = room.name,
             from = h.from,
@@ -1935,11 +2151,10 @@ impl App {
             // 先取出来：`if let` 链里的临时锁会一直持有到整条判断结束，再拿就死锁。
             let elsewhere =
                 db::assignment(&self.db(), &room)?.is_some_and(|(other, _)| other != agent);
+            let task = db::assigned_task(&self.db(), &room)?.map(|(_, t)| t);
             let r = db::room(&self.db(), &room)?;
-            if let Some(r) = r
-                && elsewhere
-            {
-                return Ok(Some(r.task()));
+            if elsewhere && let Some(task) = task.or_else(|| r.map(|r| r.task())) {
+                return Ok(Some(task));
             }
         }
         if !availability.send_recovery_probe {
@@ -1953,7 +2168,10 @@ impl App {
                 }
                 if db::assignment(&self.db(), &room.name)?.is_some_and(|(other, _)| other != agent)
                 {
-                    return Ok(Some(room.task()));
+                    let task = db::assigned_task(&self.db(), &room.name)?
+                        .map(|(_, t)| t)
+                        .unwrap_or_else(|| room.task());
+                    return Ok(Some(task));
                 }
             }
         }
@@ -1965,11 +2183,10 @@ impl App {
             }
             let elsewhere =
                 db::assignment(&self.db(), &l.room)?.is_some_and(|(other, _)| other != agent);
+            let task = db::assigned_task(&self.db(), &l.room)?.map(|(_, t)| t);
             let room = db::room(&self.db(), &l.room)?;
-            if let Some(room) = room
-                && elsewhere
-            {
-                return Ok(Some(room.task()));
+            if elsewhere && let Some(task) = task.or_else(|| room.map(|r| r.task())) {
+                return Ok(Some(task));
             }
         }
         Ok(None)
@@ -2293,6 +2510,8 @@ async fn watch(
     let agent = app.auth(&headers)?;
     let now = now_ms();
     db::touch_agent(&app.db(), &agent, now, &req.status).map_err(internal)?;
+    app.observe_watch(&agent, &req.rooms, now)
+        .map_err(internal)?;
     app.judge(&agent, &req.status, now).map_err(internal)?;
     app.judge_room_limits(&agent, &req.status, now)
         .map_err(internal)?;
@@ -2484,30 +2703,94 @@ fn router(app: Arc<App>) -> Router {
         .with_state(app)
 }
 
-/// 检测一个房间：`Some(Some(场次键))` 在播，`Some(None)` 不在播，`None` 检测失败。
-async fn detect(
+/// 检测单个直播间地址。
+async fn detect_url(
     plugins: &[Arc<dyn LivePlugin>],
     client: &reqwest::Client,
-    room: &db::Room,
-) -> Option<Option<String>> {
-    let Some(plugin) = plugins.iter().find(|p| p.matches(&room.url)) else {
-        error!(url = room.url, "no plugin matches this url");
-        return None;
+    room_name: &str,
+    url: &str,
+) -> SourceStatus {
+    let Some(plugin) = plugins.iter().find(|p| p.matches(url)) else {
+        error!(room = room_name, url, "no plugin matches this url");
+        return SourceStatus::Error;
     };
     let req = LiveRequest {
         client: client.clone(),
-        url: room.url.clone(),
-        name: room.name.clone(),
+        url: url.to_string(),
+        name: room_name.to_string(),
         options: Default::default(),
         credentials: Default::default(),
     };
     match plugin.check_stream(req).await {
-        Ok(LiveStatus::Live { stream }) => Some(Some(stream.live_session_key.unwrap_or_default())),
-        Ok(LiveStatus::Offline) => Some(None),
-        Err(e) => {
-            warn!(room = room.name, error = %e, "check stream failed");
-            None
+        Ok(LiveStatus::Live { stream }) => {
+            SourceStatus::Live(stream.live_session_key.unwrap_or_default())
         }
+        Ok(LiveStatus::Offline) => SourceStatus::Offline,
+        Err(e) => {
+            warn!(room = room_name, url, error = %e, "check stream failed");
+            SourceStatus::Error
+        }
+    }
+}
+
+/// 检测一个逻辑房间：
+/// - 录制中（`active_url` 有值）：只查当前来源；在播或报错直接返回（不查其他来源，稳定持有）；
+///   仅当当前来源确认下播且允许换源时，按配置顺序查找其他来源，找到第一个确认在播（且未被跳过）的即返回 [`RoomLive::Switch`]。
+/// - 未开录（`active_url` 为空）：从第一项开始按顺序查，离线或报错都继续查下一项，找到第一个确认在播即停止；
+///   若全部未确认在播，有任何一项报错则返回 [`RoomLive::Error`]（保持错误语义），全离线返回 [`RoomLive::Offline`]。
+async fn detect_room(
+    plugins: &[Arc<dyn LivePlugin>],
+    client: &reqwest::Client,
+    room: &db::Room,
+    active_url: Option<&str>,
+    can_switch: bool,
+    mut is_skipped: impl FnMut(&str) -> bool,
+) -> RoomLive {
+    if let Some(current_url) = active_url {
+        return match detect_url(plugins, client, &room.name, current_url).await {
+            SourceStatus::Live(session) => RoomLive::Live {
+                url: current_url.to_string(),
+                session,
+            },
+            SourceStatus::Error => RoomLive::Error,
+            SourceStatus::Offline => {
+                if can_switch {
+                    for url in room.sources() {
+                        if url == current_url {
+                            continue;
+                        }
+                        if let SourceStatus::Live(session) =
+                            detect_url(plugins, client, &room.name, url).await
+                            && !is_skipped(&session)
+                        {
+                            return RoomLive::Switch {
+                                from_url: current_url.to_string(),
+                                to_url: url.to_string(),
+                            };
+                        }
+                    }
+                }
+                RoomLive::Offline
+            }
+        };
+    }
+    let mut had_error = false;
+    for url in room.sources() {
+        match detect_url(plugins, client, &room.name, url).await {
+            SourceStatus::Live(session) => {
+                return RoomLive::Live {
+                    url: url.to_string(),
+                    session,
+                };
+            }
+            SourceStatus::Offline => {}
+            SourceStatus::Error => had_error = true,
+        }
+    }
+    if had_error {
+        RoomLive::Error
+    } else {
+        RoomLive::Offline
     }
 }
 
@@ -2527,6 +2810,9 @@ async fn tick_loop(app: Arc<App>) {
             _ = app.tick_now.notified() => {}
             _ = stop.wait_for(|s| *s) => return,
         }
+        if let Err(e) = app.settle_retiring(now_ms()) {
+            error!(error = %e, "settling retiring switches failed");
+        }
         let mut changed = false;
         let rooms = match active_rooms(&app) {
             Ok(r) => r,
@@ -2539,12 +2825,56 @@ async fn tick_loop(app: Arc<App>) {
             if app.stopping() {
                 return;
             }
-            let live = detect(&plugins, &client, room).await;
-            app.detected(&room.name, live.as_ref().map(Option::is_some));
-            if let Err(e) = app.close_orphans(&room.name, live.as_ref(), now_ms()) {
+            match app.is_retiring(&room.name) {
+                Ok(false) => {}
+                Ok(true) => continue,
+                Err(e) => {
+                    error!(room = room.name, error = %e, "reading source retirement failed");
+                    continue;
+                }
+            }
+            let active_url = {
+                let conn = app.db();
+                db::assignment(&conn, &room.name).and_then(|assignment| {
+                    if assignment.is_none() {
+                        return Ok(None);
+                    }
+                    let url = db::assigned_task(&conn, &room.name)?
+                        .map_or_else(|| room.primary_url().to_string(), |(_, task)| task.url);
+                    Ok(Some(url))
+                })
+            };
+            let active_url = match active_url {
+                Ok(url) => url,
+                Err(e) => {
+                    error!(room = room.name, error = %e, "reading assigned source failed");
+                    continue;
+                }
+            };
+            let live = detect_room(
+                &plugins,
+                &client,
+                room,
+                active_url.as_deref(),
+                !room.deleted && !room.agents.is_empty(),
+                |s| db::skipped(&app.db(), &room.name, s).unwrap_or(false),
+            )
+            .await;
+            let detected_live = match &live {
+                RoomLive::Live { .. } => Some(true),
+                RoomLive::Offline | RoomLive::Switch { .. } => Some(false),
+                RoomLive::Error => None,
+            };
+            app.detected(&room.name, detected_live);
+            let orphan_live = match &live {
+                RoomLive::Live { session, .. } => Some(Some(session.clone())),
+                RoomLive::Offline | RoomLive::Switch { .. } => Some(None),
+                RoomLive::Error => None,
+            };
+            if let Err(e) = app.close_orphans(&room.name, orphan_live.as_ref(), now_ms()) {
                 error!(room = room.name, error = %e, "closing orphaned archives failed");
             }
-            match app.schedule(room, live, now_ms()) {
+            match app.schedule_live(room, live, now_ms()) {
                 Ok(c) => changed |= c,
                 Err(e) => error!(room = room.name, error = %e, "schedule failed"),
             }
@@ -2595,11 +2925,16 @@ fn truncate(s: &str, max: usize) -> String {
 /// 不一致或旧 agent 未报时按目标时区与 `opened_at` 兜底重渲染。
 fn render(room: &db::Room, tpl: &db::Template, archive: &db::Archive, tz: FixedOffset) -> Studio {
     let started = at_tz(archive.started_at, tz);
+    let source_url = archive
+        .source_url
+        .as_deref()
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| room.primary_url());
     let fill = |t: &str| {
         let t = t
             .replace("{name}", &archive.room.replace('%', "%%"))
             .replace("{title}", &archive.title.replace('%', "%%"))
-            .replace("{url}", &room.url.replace('%', "%%"));
+            .replace("{url}", &source_url.replace('%', "%%"));
         let mut out = String::new();
         // 模板里有非法的 strftime 占位符时原样保留，不让一次格式错误挡住投稿。
         if std::fmt::Write::write_fmt(&mut out, format_args!("{}", started.format(&t))).is_err() {
@@ -2702,6 +3037,7 @@ fn app(config: Config, conn: Connection, make_bili: MakeBili, qr: Box<dyn QrLogi
         unreported: Mutex::default(),
         gates: Mutex::default(),
         stale: Mutex::default(),
+        agent_rooms: Mutex::default(),
         commit: lubic_proto::COMMIT.into(),
         stop: tokio::sync::watch::Sender::new(false),
     })
@@ -6140,6 +6476,7 @@ pub mod tests {
         let mut room = db::Room {
             name: "room_a".into(),
             url: "https://example.com/1".into(),
+            urls: vec!["https://example.com/1".into()],
             template_id: 1,
             agents: vec!["node_a".into()],
             split_time: None,
@@ -6163,6 +6500,7 @@ pub mod tests {
         let archive = db::Archive {
             room: "room_a".into(),
             account_id: Some(1),
+            source_url: None,
             title: "主标题".into(),
             started_at: ts,
             parts: vec![
@@ -6231,6 +6569,7 @@ pub mod tests {
         let single = db::Archive {
             room: "room_a".into(),
             account_id: Some(1),
+            source_url: None,
             title: "主标题".into(),
             started_at: ts,
             parts: vec![db::ArchivePart {
@@ -6249,5 +6588,466 @@ pub mod tests {
         room.display_name = Some("主播B".into());
         let studio3 = render(&room, &tpl, &single, tz);
         assert_eq!(studio3.videos[0].title, "主播B_2026-01-02T20_34_56");
+    }
+
+    #[test]
+    fn toml_import_supports_multi_source_urls_and_rejects_invalid_lists() {
+        let ok = r#"
+            db = "c.db"
+            cookies = "c.json"
+            agents = {}
+            [[rooms]]
+            name = "r"
+            urls = ["https://live.bilibili.com/11", "https://live.bilibili.com/22"]
+            [rooms.upload]
+        "#;
+        let cfg = Config::parse(ok).unwrap();
+        let (room, _) = cfg.rooms[0].import(&[]);
+        assert_eq!(room.url, "https://live.bilibili.com/11");
+        assert_eq!(
+            room.urls,
+            [
+                "https://live.bilibili.com/11",
+                "https://live.bilibili.com/22"
+            ]
+        );
+
+        let cross = r#"
+            db = "c.db"
+            cookies = "c.json"
+            agents = {}
+            [[rooms]]
+            name = "r"
+            urls = ["https://live.bilibili.com/11", "https://live.douyin.com/22"]
+            [rooms.upload]
+        "#;
+        assert!(Config::parse(cross).is_err());
+        let unknown = cross.replace("https://live.douyin.com/22", "https://example.com/22");
+        assert!(Config::parse(&unknown).is_err());
+
+        let dup = r#"
+            db = "c.db"
+            cookies = "c.json"
+            agents = {}
+            [[rooms]]
+            name = "r"
+            urls = ["https://live.bilibili.com/11", "https://live.bilibili.com/11"]
+            [rooms.upload]
+        "#;
+        assert!(Config::parse(dup).is_err());
+    }
+
+    /// 测试用假平台插件：按 URL 精确返回预设状态并记录调用顺序。
+    struct StubPlugin {
+        outcomes: Mutex<HashMap<String, Result<LiveStatus, String>>>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl StubPlugin {
+        fn new(items: &[(&str, Result<Option<&str>, &str>)]) -> Arc<Self> {
+            let mut map = HashMap::new();
+            for (url, res) in items {
+                let v = match res {
+                    Ok(Some(session)) => Ok(LiveStatus::Live {
+                        stream: Box::new(lubic::downloader::live::LiveStream {
+                            name: "r".into(),
+                            url: (*url).into(),
+                            title: "直播".into(),
+                            raw_stream_url: "https://cdn.example/live.flv".into(),
+                            platform: "bilibili".into(),
+                            stream_headers: HashMap::new(),
+                            suffix: "flv".into(),
+                            recording_quality: None,
+                            recording_quality_code: None,
+                            live_session_key: Some((*session).into()),
+                        }),
+                    }),
+                    Ok(None) => Ok(LiveStatus::Offline),
+                    Err(msg) => Err((*msg).into()),
+                };
+                map.insert((*url).to_string(), v);
+            }
+            Arc::new(Self {
+                outcomes: Mutex::new(map),
+                calls: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl LivePlugin for StubPlugin {
+        fn name(&self) -> &'static str {
+            "Stub"
+        }
+
+        fn matches(&self, url: &str) -> bool {
+            url.starts_with("https://live.bilibili.com/")
+        }
+
+        async fn check_stream(
+            &self,
+            request: LiveRequest,
+        ) -> lubic::downloader::live::LiveResult<LiveStatus> {
+            self.calls.lock().unwrap().push(request.url.clone());
+            match self.outcomes.lock().unwrap().get(&request.url).cloned() {
+                Some(Ok(status)) => Ok(status),
+                Some(Err(e)) => Err(lubic::downloader::live::LiveError::custom(e)),
+                None => Ok(LiveStatus::Offline),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn detect_room_idle_scans_in_order_and_preserves_error_semantics() {
+        let u1 = "https://live.bilibili.com/1";
+        let u2 = "https://live.bilibili.com/2";
+        let u3 = "https://live.bilibili.com/3";
+        let mut room = db::Room {
+            name: "r".into(),
+            url: u1.into(),
+            urls: vec![u1.into(), u2.into(), u3.into()],
+            template_id: 1,
+            agents: vec!["a".into()],
+            split_time: None,
+            split_size_mb: None,
+            grace: None,
+            bili_qn: None,
+            douyin_quality: None,
+            tail_upload: false,
+            display_name: None,
+            filename: db::DEFAULT_FILENAME.into(),
+            season_section_id: None,
+            tag: String::new(),
+            deleted: false,
+        };
+        let client = reqwest::Client::new();
+
+        // 1) 主房报错、副房 2 在播：同一轮继续往下查，找到第一个确认在播即停止，不查 u3。
+        let p = StubPlugin::new(&[
+            (u1, Err("timeout")),
+            (u2, Ok(Some("s2"))),
+            (u3, Ok(Some("s3"))),
+        ]);
+        let plugins: [Arc<dyn LivePlugin>; 1] = [p.clone()];
+        let got = detect_room(&plugins, &client, &room, None, true, |_| false).await;
+        assert_eq!(
+            got,
+            RoomLive::Live {
+                url: u2.into(),
+                session: "s2".into(),
+            }
+        );
+        assert_eq!(p.calls(), [u1, u2]);
+
+        // 2) 主房报错、其余离线：保持 Error 语义（不当成确认离线）。
+        let p = StubPlugin::new(&[(u1, Err("timeout")), (u2, Ok(None)), (u3, Ok(None))]);
+        let plugins: [Arc<dyn LivePlugin>; 1] = [p.clone()];
+        let got = detect_room(&plugins, &client, &room, None, true, |_| false).await;
+        assert_eq!(got, RoomLive::Error);
+        assert_eq!(p.calls(), [u1, u2, u3]);
+
+        // 3) 全部确认离线：返回 Offline。
+        let p = StubPlugin::new(&[(u1, Ok(None)), (u2, Ok(None)), (u3, Ok(None))]);
+        let plugins: [Arc<dyn LivePlugin>; 1] = [p.clone()];
+        let got = detect_room(&plugins, &client, &room, None, true, |_| false).await;
+        assert_eq!(got, RoomLive::Offline);
+        assert_eq!(p.calls(), [u1, u2, u3]);
+
+        // 4) 单地址兼容。
+        room.urls = vec![u1.into()];
+        let p = StubPlugin::new(&[(u1, Ok(Some("s1")))]);
+        let plugins: [Arc<dyn LivePlugin>; 1] = [p.clone()];
+        let got = detect_room(&plugins, &client, &room, None, true, |_| false).await;
+        assert_eq!(
+            got,
+            RoomLive::Live {
+                url: u1.into(),
+                session: "s1".into(),
+            }
+        );
+        assert_eq!(p.calls(), [u1]);
+    }
+
+    #[tokio::test]
+    async fn detect_room_recording_holds_current_source_and_only_switches_when_offline() {
+        let u1 = "https://live.bilibili.com/1";
+        let u2 = "https://live.bilibili.com/2";
+        let u3 = "https://live.bilibili.com/3";
+        let room = db::Room {
+            name: "r".into(),
+            url: u1.into(),
+            urls: vec![u1.into(), u2.into(), u3.into()],
+            template_id: 1,
+            agents: vec!["a".into()],
+            split_time: None,
+            split_size_mb: None,
+            grace: None,
+            bili_qn: None,
+            douyin_quality: None,
+            tail_upload: false,
+            display_name: None,
+            filename: db::DEFAULT_FILENAME.into(),
+            season_section_id: None,
+            tag: String::new(),
+            deleted: false,
+        };
+        let client = reqwest::Client::new();
+
+        // 1) 正在录副房 u2，即便主房 u1 已开播，也只查 u2、稳定持有不打断。
+        let p = StubPlugin::new(&[(u1, Ok(Some("s1"))), (u2, Ok(Some("s2")))]);
+        let plugins: [Arc<dyn LivePlugin>; 1] = [p.clone()];
+        let got = detect_room(&plugins, &client, &room, Some(u2), true, |_| false).await;
+        assert_eq!(
+            got,
+            RoomLive::Live {
+                url: u2.into(),
+                session: "s2".into(),
+            }
+        );
+        assert_eq!(p.calls(), [u2]);
+
+        // 2) 当前来源 u2 检测报错：保持 Error 语义，不查其他来源。
+        let p = StubPlugin::new(&[(u1, Ok(Some("s1"))), (u2, Err("502"))]);
+        let plugins: [Arc<dyn LivePlugin>; 1] = [p.clone()];
+        let got = detect_room(&plugins, &client, &room, Some(u2), true, |_| false).await;
+        assert_eq!(got, RoomLive::Error);
+        assert_eq!(p.calls(), [u2]);
+
+        // 3) 当前来源 u2 确认下播且主房 u1 在播：触发 Switch（按优先级找到 u1 即停，不查 u3）。
+        let p = StubPlugin::new(&[(u1, Ok(Some("s1"))), (u2, Ok(None)), (u3, Ok(Some("s3")))]);
+        let plugins: [Arc<dyn LivePlugin>; 1] = [p.clone()];
+        let got = detect_room(&plugins, &client, &room, Some(u2), true, |_| false).await;
+        assert_eq!(
+            got,
+            RoomLive::Switch {
+                from_url: u2.into(),
+                to_url: u1.into(),
+            }
+        );
+        assert_eq!(p.calls(), [u2, u1]);
+
+        // 4) 当前来源 u2 确认下播但其余离线/报错：按普通 Offline 走下播宽限。
+        let p = StubPlugin::new(&[(u1, Err("err")), (u2, Ok(None)), (u3, Ok(None))]);
+        let plugins: [Arc<dyn LivePlugin>; 1] = [p.clone()];
+        let got = detect_room(&plugins, &client, &room, Some(u2), true, |_| false).await;
+        assert_eq!(got, RoomLive::Offline);
+        assert_eq!(p.calls(), [u2, u1, u3]);
+    }
+
+    #[test]
+    fn source_switch_retires_old_agents_before_new_source_and_handoff_keeps_source() {
+        let (app, _) = test_app();
+        let t = now_ms();
+        let u1 = "https://live.bilibili.com/6";
+        let u2 = "https://live.bilibili.com/60";
+        let mut room = db_room(&app, "r");
+        room.urls = vec![u1.into(), u2.into()];
+        app.save_room(room, false).unwrap();
+        let room = db_room(&app, "r");
+
+        seen(&app, "a", t, false);
+        seen(&app, "b", t, false);
+
+        // 1) 未开录时选中副房 u2，分给 a。
+        assert!(
+            app.schedule_live(
+                &room,
+                RoomLive::Live {
+                    url: u2.into(),
+                    session: "s2".into(),
+                },
+                t,
+            )
+            .unwrap()
+        );
+        assert_eq!(app.desired("a").unwrap()[0].url, u2);
+        app.observe_watch("a", &["r".into()], t).unwrap();
+        db::apply(&app.db(), "a", &opened("p1", "s2", t)).unwrap();
+
+        // 2) a 受限发起交接给 b：b 拿到的任务和试拉任务都保持已选来源 u2，交接完成后快照仍是 u2。
+        db::set_limit(
+            &app.db(),
+            "a",
+            &db::Limit {
+                since: t,
+                until: t + 20 * MIN,
+                reason: "record rate 0.50".into(),
+                need_bps: 100.0,
+            },
+        )
+        .unwrap();
+        assert!(
+            app.schedule_live(
+                &room,
+                RoomLive::Live {
+                    url: u2.into(),
+                    session: "s2".into(),
+                },
+                t + MIN,
+            )
+            .unwrap()
+        );
+        assert_eq!(app.desired("b").unwrap()[0].url, u2);
+        app.observe_watch("b", &["r".into()], t + MIN).unwrap();
+        db::apply(
+            &app.db(),
+            "b",
+            &AgentEvent::Recording {
+                room: "r".into(),
+                lag_ms: Some(1000),
+                start_live_ms: None,
+            },
+        )
+        .unwrap();
+        // 交接完成，但旧 agent a 还没通过下一次 /v1/watch 确认停掉旧任务。
+        seen(&app, "a", t + 2 * MIN, false);
+        seen(&app, "b", t + 2 * MIN, false);
+        assert!(
+            app.schedule_live(
+                &room,
+                RoomLive::Live {
+                    url: u2.into(),
+                    session: "s2".into(),
+                },
+                t + 2 * MIN,
+            )
+            .unwrap()
+        );
+        assert_eq!(assigned(&app, "r").as_deref(), Some("b"));
+        assert_eq!(app.desired("b").unwrap()[0].url, u2);
+        assert!(app.desired("a").unwrap().is_empty());
+
+        // a 到期前试拉：应试拉当前在录的副房 u2 而不是主房 u1。
+        assert_eq!(app.probe_for("a", t + 18 * MIN).unwrap().unwrap().url, u2);
+
+        // 3) 此时 u2 确认下播且主房 u1 开播：撤掉旧任务，同时等待 b 与仍在退场中的旧机 a 确认退出。
+        seen(&app, "a", t + 3 * MIN, false);
+        seen(&app, "b", t + 3 * MIN, false);
+        assert!(
+            app.schedule_live(
+                &room,
+                RoomLive::Switch {
+                    from_url: u2.into(),
+                    to_url: u1.into(),
+                },
+                t + 3 * MIN,
+            )
+            .unwrap()
+        );
+        assert_eq!(assigned(&app, "r"), None);
+        assert!(app.is_retiring("r").unwrap());
+
+        // 总控重启后仍须等待两台机器退场。
+        let (restarted, _) = test_app();
+        *restarted.db() = std::mem::replace(&mut *app.db(), mem());
+        let app = restarted;
+        assert!(app.is_retiring("r").unwrap());
+
+        // b 还没退场、a 还没退场：新来源不能开，旧机 a 也不会重开另一个来源。
+        assert!(
+            !app.schedule_live(
+                &room,
+                RoomLive::Live {
+                    url: u1.into(),
+                    session: "s1".into(),
+                },
+                t + 3 * MIN + 1_000,
+            )
+            .unwrap()
+        );
+        assert_eq!(assigned(&app, "r"), None);
+
+        // b 确认退场，但旧机 a 仍报着 "r"：仍然不能开新来源。
+        app.observe_watch("b", &[], t + 3 * MIN + 2_000).unwrap();
+        assert!(app.is_retiring("r").unwrap());
+        assert!(
+            !app.schedule_live(
+                &room,
+                RoomLive::Live {
+                    url: u1.into(),
+                    session: "s1".into(),
+                },
+                t + 3 * MIN + 2_000,
+            )
+            .unwrap()
+        );
+        assert_eq!(assigned(&app, "r"), None);
+
+        // a 也确认退场后，旧稿件收尾（保留宽限），新来源 u1 才能正式分配，且只有一路。
+        app.observe_watch("a", &[], t + 3 * MIN + 3_000).unwrap();
+        assert!(!app.is_retiring("r").unwrap());
+        assert!(!db::recording(&app.db(), "r").unwrap());
+        assert!(
+            app.schedule_live(
+                &room,
+                RoomLive::Live {
+                    url: u1.into(),
+                    session: "s1".into(),
+                },
+                t + 3 * MIN + 3_000,
+            )
+            .unwrap()
+        );
+        let winner = assigned(&app, "r").unwrap();
+        assert_eq!(app.desired(&winner).unwrap()[0].url, u1);
+        let other = if winner == "a" { "b" } else { "a" };
+        assert!(app.desired(other).unwrap().is_empty());
+    }
+
+    #[test]
+    fn render_pins_archive_source_url_and_falls_back_for_legacy_archives() {
+        let tz = parse_timezone("+08:00").unwrap();
+        let u1 = "https://live.bilibili.com/10";
+        let u2 = "https://live.bilibili.com/20";
+        let room = db::Room {
+            name: "room_a".into(),
+            url: u1.into(),
+            urls: vec![u1.into()],
+            template_id: 1,
+            agents: vec!["a".into()],
+            split_time: None,
+            split_size_mb: None,
+            grace: None,
+            bili_qn: None,
+            douyin_quality: None,
+            tail_upload: false,
+            display_name: None,
+            filename: db::DEFAULT_FILENAME.into(),
+            season_section_id: None,
+            tag: String::new(),
+            deleted: false,
+        };
+        let tpl = db::Template {
+            title: "{name}".into(),
+            desc: "直播间：{url}".into(),
+            source: "{url}".into(),
+            copyright: 2,
+            ..Default::default()
+        };
+        // 即使配置已改回单主房 u1，首分P在 u2 录制的稿件投稿时 `{url}` 仍固定为 u2。
+        let pinned = db::Archive {
+            room: "room_a".into(),
+            account_id: Some(1),
+            source_url: Some(u2.into()),
+            title: "t".into(),
+            started_at: 0,
+            parts: vec![],
+        };
+        let studio = render(&room, &tpl, &pinned, tz);
+        assert_eq!(studio.source, u2);
+        assert_eq!(studio.desc, format!("直播间：{u2}"));
+
+        // 历史稿件 source_url 为 None 时合理回退主房地址 u1。
+        let legacy = db::Archive {
+            source_url: None,
+            ..pinned
+        };
+        let studio_legacy = render(&room, &tpl, &legacy, tz);
+        assert_eq!(studio_legacy.source, u1);
+        assert_eq!(studio_legacy.desc, format!("直播间：{u1}"));
     }
 }

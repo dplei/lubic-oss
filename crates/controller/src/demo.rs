@@ -37,6 +37,7 @@ fn part_event(
             reason: CloseReason::TimedSplit,
             title: title.into(),
             closed_at_ms: None,
+            source_url: None,
         })
     } else {
         Event::PartOpened(PartOpened {
@@ -45,6 +46,7 @@ fn part_event(
             path: format!("/rec/{part}.flv.part").into(),
             title: title.into(),
             tz_offset_secs: Some(8 * 3600),
+            source_url: None,
         })
     };
     AgentEvent::Recorder { event, at }
@@ -150,6 +152,7 @@ fn seed(app: &App, now: i64) {
         let room = db::Room {
             name: name.into(),
             url: url.into(),
+            urls: vec![url.into()],
             template_id: 1,
             agents: agents.iter().map(|a| a.to_string()).collect(),
             split_time: Some(split),

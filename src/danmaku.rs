@@ -639,6 +639,7 @@ mod tests {
             path: dir.join(format!("{id}.flv.part")),
             title: String::new(),
             tz_offset_secs: None,
+            source_url: None,
         })
     }
 
@@ -652,6 +653,7 @@ mod tests {
             reason: CloseReason::TimedSplit,
             title: String::new(),
             closed_at_ms: None,
+            source_url: None,
         }
     }
 
