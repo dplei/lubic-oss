@@ -8,6 +8,7 @@ mod pipeline;
 mod trial;
 
 use async_trait::async_trait;
+use chrono::FixedOffset;
 use clap::Parser;
 use lubic::downloader::live::{LivePlugin, builtin_plugins};
 use lubic::recorder::{Pace, RecordConfig, watch_room};
@@ -19,8 +20,8 @@ use lubic_proto::{
 use lubic_upos::{Checkpoint, Growth, Ticket};
 use monitor::Monitor;
 use pipeline::{Link, Outbox, Pipeline, Remote, report_loop, write_json};
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -98,6 +99,7 @@ impl Config {
         room: &RoomTask,
         events: UnboundedSender<Event>,
         pace: Arc<Pace>,
+        tz_offset: Option<FixedOffset>,
     ) -> RecordConfig {
         let filename = match room.filename.as_str() {
             "" => LEGACY_FILENAME,
@@ -115,6 +117,7 @@ impl Config {
             split_size: room.split_size_mb.map(|mb| mb * 1024 * 1024),
             events: Some(events),
             pace: Some(pace),
+            tz_offset,
             ..Default::default()
         };
         if let Some(grace) = room.grace {
@@ -141,8 +144,9 @@ impl Config {
         room: &RoomTask,
         events: UnboundedSender<Event>,
         pace: Arc<Pace>,
+        tz_offset: Option<FixedOffset>,
     ) -> RecordConfig {
-        let mut c = self.record_config(room, events, pace);
+        let mut c = self.record_config(room, events, pace, tz_offset);
         c.output = self
             .probe_dir()
             .join("{name}")
@@ -164,8 +168,9 @@ impl Config {
         room: &RoomTask,
         events: UnboundedSender<Event>,
         pace: Arc<Pace>,
+        tz_offset: Option<FixedOffset>,
     ) -> RecordConfig {
-        let mut c = self.record_config(room, events, pace);
+        let mut c = self.record_config(room, events, pace, tz_offset);
         let dir = self.trial_dir().join("{name}");
         // 旧写法的 `output` 没有单独的文件名模板，暂存目录要自带文件名。
         let dir = match self.legacy_output() {
@@ -327,6 +332,8 @@ struct Rooms<'a> {
     monitor: &'a Monitor,
     /// 平台插件，测试里换成本地的。
     plugins: Vec<Arc<dyn LivePlugin>>,
+    /// 总控下发的统一时区偏移；`None` 时退回本机 `Local`。
+    tz_offset: Option<FixedOffset>,
 }
 
 /// 总控派来试拉的房间在本机用的任务：名字带 [`PROBE_PREFIX`]，监测里与正常录制分开计数。
@@ -354,7 +361,8 @@ fn clear_side_dirs(config: &Config) {
     clear_probe_dir(&config.trial_dir());
 }
 
-type MakeConfig = fn(&Config, &RoomTask, UnboundedSender<Event>, Arc<Pace>) -> RecordConfig;
+type MakeConfig =
+    fn(&Config, &RoomTask, UnboundedSender<Event>, Arc<Pace>, Option<FixedOffset>) -> RecordConfig;
 
 impl Recorder {
     fn start(rooms: &Rooms, task: &RoomTask) -> Option<Self> {
@@ -405,7 +413,7 @@ impl Recorder {
             plugin,
             task.name.clone(),
             task.url.clone(),
-            Arc::new(make(config, task, events, pace.clone())),
+            Arc::new(make(config, task, events, pace.clone(), rooms.tz_offset)),
             cancel.clone(),
         ));
         Some(Self {
@@ -434,9 +442,12 @@ struct Trial {
 impl Trial {
     /// `task` 是总控下发的原样，录制用真实房间名（分段归属对得上），监测键带 [`TRIAL_PREFIX`]。
     fn start(rooms: &Rooms, task: &RoomTask) -> Option<Self> {
-        let formal = rooms
-            .config
-            .record_config(task, rooms.events.clone(), Default::default());
+        let formal = rooms.config.record_config(
+            task,
+            rooms.events.clone(),
+            Default::default(),
+            rooms.tz_offset,
+        );
         let gate = Arc::new(Gate::new(
             rooms.config.trial_dir(),
             formal,
@@ -468,6 +479,16 @@ impl Trials {
         self.trialing
             .as_ref()
             .map(|t| t.recorder.task.name.as_str())
+    }
+
+    fn set_tz_offset(&self, tz: Option<FixedOffset>) {
+        if let Some(r) = &self.probing {
+            r.pace.set_tz_offset(tz);
+        }
+        if let Some(t) = &self.trialing {
+            t.recorder.pace.set_tz_offset(tz);
+            t.gate.set_tz_offset(tz);
+        }
     }
 
     /// 让在跑的试拉与总控要的一致。停录时两种都不跑；同时下发时只跑故障试拉。
@@ -631,10 +652,30 @@ fn lock_state(state: &Path) -> Result<std::fs::File, String> {
     Ok(f)
 }
 
-fn load_rooms(path: &Path) -> Vec<RoomTask> {
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct SavedRooms {
+    rooms: Vec<RoomTask>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tz_offset_secs: Option<i32>,
+}
+
+fn load_rooms(path: &Path) -> SavedRooms {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StoredRooms {
+        Current(SavedRooms),
+        Legacy(Vec<RoomTask>),
+    }
     std::fs::read(path)
         .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
+        .and_then(|b| serde_json::from_slice::<StoredRooms>(&b).ok())
+        .map(|stored| match stored {
+            StoredRooms::Current(s) => s,
+            StoredRooms::Legacy(rooms) => SavedRooms {
+                rooms,
+                tz_offset_secs: None,
+            },
+        })
         .unwrap_or_default()
 }
 
@@ -681,16 +722,20 @@ async fn run(config: Config) -> Result<(), String> {
         link.clone(),
         shutdown.clone(),
     ));
-    let rooms = Rooms {
+    // 总控失联时照最后一份清单与时区继续录，重启也一样。
+    let rooms_path = config.state.with_extension("rooms.json");
+    let saved = load_rooms(&rooms_path);
+    let mut assigned = saved.rooms;
+    let mut tz_offset_secs = saved
+        .tz_offset_secs
+        .filter(|&s| FixedOffset::east_opt(s).is_some());
+    let mut rooms = Rooms {
         config: &config,
         events: &tx,
         monitor: &monitor,
         plugins: builtin_plugins(),
+        tz_offset: tz_offset_secs.and_then(FixedOffset::east_opt),
     };
-
-    // 总控失联时照最后一份清单继续录，重启也一样。
-    let rooms_path = config.state.with_extension("rooms.json");
-    let mut assigned = load_rooms(&rooms_path);
     let mut cuts: Vec<(String, i64)> = Vec::new();
     let mut trial_drop: Vec<String> = Vec::new();
     // 总控要试拉的房间（原样）与在跑的试拉。
@@ -796,9 +841,37 @@ async fn run(config: Config) -> Result<(), String> {
                 }
                 probe = a.probe;
                 trial = a.trial;
-                if a.rooms != assigned {
+                let next_tz_secs = match a.tz_offset_secs {
+                    Some(s) if FixedOffset::east_opt(s).is_some() => Some(s),
+                    Some(s) => {
+                        warn!(
+                            tz_offset_secs = s,
+                            "ignoring out-of-range tz_offset_secs from controller"
+                        );
+                        tz_offset_secs
+                    }
+                    None => None,
+                };
+                let tz_changed = next_tz_secs != tz_offset_secs;
+                if tz_changed {
+                    tz_offset_secs = next_tz_secs;
+                    rooms.tz_offset = tz_offset_secs.and_then(FixedOffset::east_opt);
+                    for r in running.values() {
+                        r.pace.set_tz_offset(rooms.tz_offset);
+                    }
+                    trials.set_tz_offset(rooms.tz_offset);
+                    info!(?tz_offset_secs, "updated recording timezone offset");
+                }
+                let rooms_changed = a.rooms != assigned;
+                if rooms_changed {
                     assigned = a.rooms;
-                    if let Err(e) = write_json(&rooms_path, &assigned) {
+                }
+                if rooms_changed || tz_changed {
+                    let saved = SavedRooms {
+                        rooms: assigned.clone(),
+                        tz_offset_secs,
+                    };
+                    if let Err(e) = write_json(&rooms_path, &saved) {
                         warn!(path = %rooms_path.display(), error = %e, "failed to save room list");
                     }
                 }
@@ -936,7 +1009,7 @@ mod tests {
         t.filename = "{streamer} %H{colon}%M".into();
         t.streamer = "Secret（王者组排）".into();
         let tpl = |c: &Config, t: &RoomTask| {
-            let rc = c.record_config(t, unbounded_channel().0, Default::default());
+            let rc = c.record_config(t, unbounded_channel().0, Default::default(), None);
             lubic::recorder::file_template(&rc, &t.name, "标题")
         };
         assert_eq!(tpl(&c, &t), "/rec/Secret/Secret（王者组排） %H:%M");
@@ -953,11 +1026,18 @@ mod tests {
         let c = config();
         assert_eq!((c.line.as_str(), c.disk_threshold), ("tx", 0.85));
         assert_eq!(Controller::new(&c).base, "http://127.0.0.1:7070");
-        let rc = c.record_config(&task("6", "u"), unbounded_channel().0, Default::default());
+        let tz = FixedOffset::east_opt(8 * 3600);
+        let rc = c.record_config(
+            &task("6", "u"),
+            unbounded_channel().0,
+            Default::default(),
+            tz,
+        );
         assert_eq!(rc.offline_grace, Duration::from_secs(10));
         assert_eq!(rc.split_time, Some(Duration::from_secs(120)));
         assert_eq!(rc.options.bilibili.qn, 10000);
         assert_eq!(rc.options.douyin.quality, "hd");
+        assert_eq!(rc.tz_offset, tz);
     }
 
     /// 试拉写进录制目录下的 `.probe/`、不发事件；任务名带前缀，不边录边传。
@@ -970,11 +1050,53 @@ mod tests {
         let p = probe_task(&t);
         assert_eq!(p.name, "probe:Secret");
         assert!(!p.tail_upload);
-        let rc = c.probe_config(&p, unbounded_channel().0, Default::default());
+        let tz = FixedOffset::east_opt(9 * 3600);
+        let rc = c.probe_config(&p, unbounded_channel().0, Default::default(), tz);
         assert!(rc.events.is_none());
         assert_eq!(rc.output, "/tmp/.probe/{name}");
         assert_eq!(c.probe_dir(), PathBuf::from("/tmp/.probe"));
         assert_eq!(rc.filename.as_deref(), Some(LEGACY_FILENAME));
+        assert_eq!(rc.tz_offset, tz);
+    }
+
+    /// 正常录制、legacy_output、试拉与故障试拉都继承总控下发的时区偏移。
+    #[test]
+    fn tz_offset_flows_into_legacy_and_trial_configs() {
+        let mut c = config();
+        c.output = "/tmp/rec/{name}/{name}_%Y-%m-%dT%H_%M_%S".into();
+        assert!(c.legacy_output());
+        let tz = FixedOffset::west_opt(5 * 3600);
+        let t = task("r", "u");
+        assert_eq!(
+            c.record_config(&t, unbounded_channel().0, Default::default(), tz)
+                .tz_offset,
+            tz
+        );
+        assert_eq!(
+            c.trial_config(&t, unbounded_channel().0, Default::default(), tz)
+                .tz_offset,
+            tz
+        );
+    }
+
+    /// `.rooms.json` 读写兼容旧版纯数组 JSON 与新版带 `tz_offset_secs` 的对象。
+    #[test]
+    fn load_rooms_supports_legacy_array_and_saved_object() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("s.rooms.json");
+        let t = task("r", "u");
+        // 旧版纯数组 JSON
+        write_json(&path, &[&t]).unwrap();
+        let legacy = load_rooms(&path);
+        assert_eq!(legacy.rooms, std::slice::from_ref(&t));
+        assert_eq!(legacy.tz_offset_secs, None);
+        // 新版对象（含 tz_offset_secs）
+        let saved = SavedRooms {
+            rooms: vec![t.clone()],
+            tz_offset_secs: Some(28800),
+        };
+        write_json(&path, &saved).unwrap();
+        assert_eq!(load_rooms(&path), saved);
     }
 
     #[test]
@@ -1065,6 +1187,7 @@ mod tests {
                         stream_headers: Default::default(),
                         suffix: "flv".into(),
                         recording_quality: None,
+                        recording_quality_code: None,
                         live_session_key: Some("s".into()),
                     }),
                 },
@@ -1110,6 +1233,7 @@ mod tests {
             events: &tx,
             monitor: &monitor,
             plugins: vec![Arc::new(Live(Some(url)))],
+            tz_offset: None,
         };
         let mut t = task("r", "u");
         t.tail_upload = true;
@@ -1159,6 +1283,7 @@ mod tests {
             events: &tx,
             monitor: &monitor,
             plugins: vec![Arc::new(Live(Some(url)))],
+            tz_offset: None,
         };
         let t = task("r", "u");
         let mut slot = Trials::default();
@@ -1237,6 +1362,7 @@ mod tests {
             events: &tx,
             monitor: &monitor,
             plugins: vec![Arc::new(Live(Some(url)))],
+            tz_offset: None,
         };
         let t = task("r", "u");
         let mut slot = Trials::default();
@@ -1289,6 +1415,7 @@ mod tests {
             events: &tx,
             monitor: &monitor,
             plugins: vec![Arc::new(Live(None))],
+            tz_offset: None,
         };
         let (p, t) = (task("p", "u"), task("t", "u"));
         let mut slot = Trials::default();

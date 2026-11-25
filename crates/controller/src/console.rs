@@ -383,7 +383,8 @@ impl App {
     pub fn cover_preview(&self, name: &str) -> Result<Vec<u8>> {
         let room = self.get_room(name)?;
         let bg = db::cover_bg(&self.db(), name)?;
-        let at = chrono::Local::now()
+        let at = chrono::Utc::now()
+            .with_timezone(&self.tz)
             .format(crate::cover::TIME_FORMAT)
             .to_string();
         Ok(crate::cover::render(
@@ -1027,7 +1028,7 @@ pub fn routes(app: Arc<App>) -> Router<Arc<App>> {
 
 /// 控制台页面本身不用登录：没有会话时它自己显示登录表单。
 /// Logo 内联进页面，红灯 `#rec` 闪不闪由页面按「有没有房间在录」决定。
-async fn page() -> Html<String> {
+async fn page(State(app): S) -> Html<String> {
     let logo = without_style(include_str!("../../../docs/brand/icon.svg")).replacen(
         "<svg ",
         "<svg aria-hidden=\"true\" ",
@@ -1039,7 +1040,7 @@ async fn page() -> Html<String> {
             .replace("{{logo}}", &logo)
             .replace(
                 "{{pushed_at}}",
-                &push_time(option_env!("GIT_PUSHED_AT").unwrap_or("")),
+                &push_time(option_env!("GIT_PUSHED_AT").unwrap_or(""), app.tz),
             ),
     )
 }
@@ -1055,17 +1056,18 @@ fn commit_link(commit: &str) -> String {
     }
 }
 
-/// GitHub push 事件里的 unix 秒数，固定显示北京时间。
-fn push_time(value: &str) -> String {
+/// GitHub push 事件里的 unix 秒数，按总控配置时区格式化。
+fn push_time(value: &str, tz: chrono::FixedOffset) -> String {
     value
         .parse::<i64>()
         .ok()
         .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
         .map(|at| {
+            let local = at.with_timezone(&tz);
             format!(
-                "推送到 GitHub：{}（北京时间）",
-                at.with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap())
-                    .format("%Y-%m-%d %H:%M:%S")
+                "推送到 GitHub：{}（UTC{}）",
+                local.format("%Y-%m-%d %H:%M:%S"),
+                local.format("%:z"),
             )
         })
         .unwrap_or_else(|| "未记录 GitHub 推送时间".into())
@@ -1989,25 +1991,34 @@ mod tests {
     }
 
     #[test]
-    fn push_time_is_beijing_time_and_handles_missing_values() {
+    fn push_time_uses_controller_timezone_and_handles_missing_values() {
+        let plus8 = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+        let minus5 = chrono::FixedOffset::west_opt(5 * 3600).unwrap();
         assert_eq!(
-            push_time("0"),
-            "推送到 GitHub：1970-01-01 08:00:00（北京时间）"
+            push_time("0", plus8),
+            "推送到 GitHub：1970-01-01 08:00:00（UTC+08:00）"
+        );
+        assert_eq!(
+            push_time("0", minus5),
+            "推送到 GitHub：1969-12-31 19:00:00（UTC-05:00）"
         );
         for value in ["", "invalid", "9223372036854775807"] {
-            assert_eq!(push_time(value), "未记录 GitHub 推送时间");
+            assert_eq!(push_time(value, plus8), "未记录 GitHub 推送时间");
         }
     }
 
     #[tokio::test]
     async fn page_is_served_without_a_session() {
-        let (base, _, _) = serve().await;
+        let (base, app, _) = serve().await;
         let res = reqwest::get(format!("{base}/")).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         let html = res.text().await.unwrap();
         assert!(html.contains("lubic 控制台") && !html.contains("{{commit}}"));
         assert!(!html.contains("{{pushed_at}}"));
-        assert!(html.contains(&push_time(option_env!("GIT_PUSHED_AT").unwrap_or(""))));
+        assert!(html.contains(&push_time(
+            option_env!("GIT_PUSHED_AT").unwrap_or(""),
+            app.tz
+        )));
         assert!(
             html.contains("id=\"rec\"")
                 && !html.contains("{{logo}}")

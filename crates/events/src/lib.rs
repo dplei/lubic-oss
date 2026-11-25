@@ -23,6 +23,10 @@ pub struct PartOpened {
     pub path: PathBuf,
     /// 直播标题，同 [`PartClosed::title`]。
     pub title: String,
+    /// 建文件渲染 `path` 时实际使用的 UTC 偏移秒数（东偏为正，如 `+08:00` 为 `28800`）。
+    /// 旧 agent 不报时为 `None`，总控投稿时按配置时区兜底重渲染分P标题。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tz_offset_secs: Option<i32>,
 }
 
 /// 分段已收尾，`path` 是改名后的最终文件，可以上传了。

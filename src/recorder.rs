@@ -7,7 +7,7 @@ use crate::downloader::flv_parser::header;
 use crate::downloader::hls;
 use crate::downloader::httpflv::{self, Connection};
 use crate::downloader::live::{
-    LiveCredentials, LiveOptions, LivePlugin, LiveRequest, LiveStatus, LiveStream,
+    LiveCredentials, LiveOptions, LivePlugin, LiveRequest, LiveStatus, LiveStream, douyin,
     media_ext_from_url,
 };
 use crate::downloader::util::{
@@ -28,6 +28,12 @@ const RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
 const RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
 /// 停止时等录制在下一个关键帧收尾的上限，超时直接丢弃（drop 兜底收尾，丢最后一个 GOP）。
 const STOP_GRACE: Duration = Duration::from_secs(10);
+/// 抖音画质复查：前 5 分钟每 30 秒一次，之后每 120 秒一次；单次接口复查最多 10 秒，切段等待最多 5 秒。
+const QUALITY_RECHECK_FAST_INTERVAL: Duration = Duration::from_secs(30);
+const QUALITY_RECHECK_SLOW_INTERVAL: Duration = Duration::from_secs(120);
+const QUALITY_RECHECK_FAST_WINDOW: Duration = Duration::from_secs(5 * 60);
+const QUALITY_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+const QUALITY_HANDOVER_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone)]
 pub struct RecordConfig {
@@ -55,6 +61,8 @@ pub struct RecordConfig {
     /// 暂存录制（故障试拉，见 agent）：`pace` 转正（[`Pace::promote`]）之前的分段写这个目录模板，代替 `output`；
     /// 转正后同一条连接在下一个关键帧切段，之后的分段写 `output`。事件照常发，由接收方决定要不要放行。
     pub staging: Option<String>,
+    /// 渲染录像文件名 strftime 用的时区偏移；`None` 时走本机 `Local`（单机 CLI 默认行为）。
+    pub tz_offset: Option<chrono::FixedOffset>,
 }
 
 impl Default for RecordConfig {
@@ -73,6 +81,7 @@ impl Default for RecordConfig {
             events: None,
             pace: None,
             staging: None,
+            tz_offset: None,
         }
     }
 }
@@ -149,25 +158,57 @@ async fn record_session(
     let mut previous_live_ms = None;
     // 上一条有效连接之后复查过不在播：下一个接缝跨过了下播宽限，不计入健康检测。
     let mut crossed_grace = false;
+    let session_started_at = tokio::time::Instant::now();
+    let mut next_quality_recheck_at: Option<tokio::time::Instant> = None;
+    let mut preopened: Option<Connection> = None;
+    let mut skip_gap_health = false;
+    let mut pending_quality_upgrade: Option<httpflv::PendingQualityUpgrade> = None;
     if let Some(pace) = &config.pace {
         pace.record_recovered();
         pace.confirm_live();
     }
     loop {
-        if let Some(pace) = &config.pace {
+        if pending_quality_upgrade.is_none()
+            && let Some(pace) = &config.pace
+        {
             pace.set_quality(stream.recording_quality.clone());
+        }
+        if quality_upgrade_needed(&stream, config).is_some() {
+            if next_quality_recheck_at.is_none() {
+                let now = tokio::time::Instant::now();
+                next_quality_recheck_at =
+                    Some(now + next_quality_recheck_delay(session_started_at, now));
+            }
+        } else {
+            next_quality_recheck_at = None;
         }
         let mut progress = httpflv::FlvProgress {
             reconnecting,
             previous_live_ms,
             crossed_grace,
+            skip_gap_health,
+            pending_quality_upgrade: pending_quality_upgrade.take(),
             ..Default::default()
         };
+        skip_gap_health = false;
         // 下播宽限中发起的重连不算频繁短连接（handoff-health.md §3）。
         let in_grace = offline.offline_since.is_some();
-        let productive = record_once(&stream, &session, config, cancel, &mut progress).await;
-        let connected = config.pace.as_ref().and_then(|p| p.take_connected());
-        let ended = (Instant::now(), unix_now_ms());
+        let outcome = record_once_with_upgrade(
+            &stream,
+            &session,
+            config,
+            cancel,
+            &mut progress,
+            preopened.take(),
+            Some((
+                plugin,
+                request,
+                session_started_at,
+                &mut next_quality_recheck_at,
+            )),
+        )
+        .await;
+        let productive = outcome.productive;
         reconnecting = true;
         if productive {
             previous_live_ms = progress.last_live_ms;
@@ -176,6 +217,24 @@ async fn record_session(
         if cancel.is_cancelled() || cut_done(config) {
             return None;
         }
+        if let Some(candidate) = outcome.upgraded_to {
+            if let Some(pace) = &config.pace {
+                // 清理旧连接的 connected_at，但不计入频繁短连接或故障重试。
+                let _ = pace.take_connected();
+                pace.confirm_live();
+            }
+            skip_gap_health = true;
+            pending_quality_upgrade = Some(httpflv::PendingQualityUpgrade {
+                from_quality: stream_quality_label(&stream),
+                to_quality: stream_quality_label(&candidate.stream),
+                pace_quality: candidate.stream.recording_quality.clone(),
+            });
+            stream = candidate.stream;
+            preopened = Some(candidate.connection);
+            continue;
+        }
+        let connected = config.pace.as_ref().and_then(|p| p.take_connected());
+        let ended = (Instant::now(), unix_now_ms());
         // 拿到过真实媒体就清零失败计数和下播宽限（断流后可能直接重试就恢复了，
         // 不经过返回 Live 的复查）；否则递增，退避逐次加长。
         if productive {
@@ -275,8 +334,141 @@ fn new_session(current: &str, next: Option<&str>) -> bool {
     !current.is_empty() && next.is_some_and(|k| !k.is_empty() && k != current)
 }
 
+struct ReadyCandidate {
+    stream: LiveStream,
+    connection: Connection,
+}
+
+struct RecordOnceOutcome {
+    productive: bool,
+    upgraded_to: Option<ReadyCandidate>,
+}
+
+fn is_formal_recording(config: &RecordConfig) -> bool {
+    config.events.is_some()
+        && !(config.staging.is_some() && !config.pace.as_ref().is_some_and(|p| p.formal()))
+}
+
+fn quality_upgrade_needed(stream: &LiveStream, config: &RecordConfig) -> Option<usize> {
+    if stream.platform != "douyin" || config.options.douyin.protocol == "hls" {
+        return None;
+    }
+    let current_rank = stream
+        .recording_quality_code
+        .as_deref()
+        .and_then(douyin::quality_rank)?;
+    let requested_rank = douyin::quality_rank(douyin::normalize_requested_quality(
+        &config.options.douyin.quality,
+    ))?;
+    (current_rank < requested_rank).then_some(current_rank)
+}
+
+fn is_eligible_upgrade_candidate(
+    current: &LiveStream,
+    candidate: &LiveStream,
+    requested_quality: &str,
+) -> bool {
+    if candidate.platform != "douyin"
+        || matches!(
+            media_ext_from_url(&candidate.raw_stream_url).as_deref(),
+            Some("m3u8" | "ts")
+        )
+    {
+        return false;
+    }
+    let Some(cur_sess) = current
+        .live_session_key
+        .as_deref()
+        .filter(|s| !s.is_empty())
+    else {
+        return false;
+    };
+    let Some(cand_sess) = candidate
+        .live_session_key
+        .as_deref()
+        .filter(|s| !s.is_empty())
+    else {
+        return false;
+    };
+    if cur_sess != cand_sess {
+        return false;
+    }
+    let Some(cur_rank) = current
+        .recording_quality_code
+        .as_deref()
+        .and_then(douyin::quality_rank)
+    else {
+        return false;
+    };
+    let Some(cand_rank) = candidate
+        .recording_quality_code
+        .as_deref()
+        .and_then(douyin::quality_rank)
+    else {
+        return false;
+    };
+    let Some(req_rank) =
+        douyin::quality_rank(douyin::normalize_requested_quality(requested_quality))
+    else {
+        return false;
+    };
+    cur_rank < cand_rank && cand_rank <= req_rank
+}
+
+fn next_quality_recheck_delay(
+    session_started_at: tokio::time::Instant,
+    now: tokio::time::Instant,
+) -> Duration {
+    if now.saturating_duration_since(session_started_at) < QUALITY_RECHECK_FAST_WINDOW {
+        QUALITY_RECHECK_FAST_INTERVAL
+    } else {
+        QUALITY_RECHECK_SLOW_INTERVAL
+    }
+}
+
+fn stream_quality_label(stream: &LiveStream) -> String {
+    stream
+        .recording_quality
+        .clone()
+        .or_else(|| stream.recording_quality_code.clone())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+async fn probe_upgrade_candidate(
+    current: &LiveStream,
+    config: &RecordConfig,
+    plugin: &dyn LivePlugin,
+    request: &impl Fn() -> LiveRequest,
+) -> Option<ReadyCandidate> {
+    let Ok(Ok(LiveStatus::Live { stream: candidate })) =
+        tokio::time::timeout(QUALITY_CHECK_TIMEOUT, plugin.check_stream(request())).await
+    else {
+        return None;
+    };
+    if !is_eligible_upgrade_candidate(current, &candidate, &config.options.douyin.quality) {
+        return None;
+    }
+    let headers = header_map(&candidate.stream_headers).ok()?;
+    let mut cand_client = StatelessClient::new(headers);
+    cand_client
+        .headers
+        .append(ACCEPT_ENCODING, HeaderValue::from_static("gzip, deflate"));
+    let connection = httpflv::probe_candidate(
+        &cand_client,
+        &candidate.raw_stream_url,
+        config.stall_timeout,
+    )
+    .await
+    .ok()?;
+    Some(ReadyCandidate {
+        stream: *candidate,
+        connection,
+    })
+}
+
 /// 一次拉流尝试，返回是否拿到了真实媒体。已知 HLS 直接走 HLS；其余先试 FLV，
 /// 响应不是 FLV 头时回落 HLS。
+#[cfg(test)]
 async fn record_once(
     stream: &LiveStream,
     session: &str,
@@ -284,11 +476,35 @@ async fn record_once(
     cancel: &CancellationToken,
     progress: &mut httpflv::FlvProgress,
 ) -> bool {
+    record_once_with_upgrade::<fn() -> LiveRequest>(
+        stream, session, config, cancel, progress, None, None,
+    )
+    .await
+    .productive
+}
+
+async fn record_once_with_upgrade<F: Fn() -> LiveRequest>(
+    stream: &LiveStream,
+    session: &str,
+    config: &RecordConfig,
+    cancel: &CancellationToken,
+    progress: &mut httpflv::FlvProgress,
+    preopened: Option<Connection>,
+    recheck: Option<(
+        &dyn LivePlugin,
+        &F,
+        tokio::time::Instant,
+        &mut Option<tokio::time::Instant>,
+    )>,
+) -> RecordOnceOutcome {
     let headers = match header_map(&stream.stream_headers) {
         Ok(headers) => headers,
         Err(e) => {
             error!(room = stream.name, error = e, "invalid stream headers");
-            return false;
+            return RecordOnceOutcome {
+                productive: false,
+                upgraded_to: None,
+            };
         }
     };
     let mut client = StatelessClient::new(headers);
@@ -312,6 +528,9 @@ async fn record_once(
     let close_handle = SegmentCloseHandle::default();
     let productive = AtomicBool::new(false);
     let started = AtomicBool::new(false);
+    let flv_started = AtomicBool::new(false);
+    let flv_started_notify = tokio::sync::Notify::new();
+    let upgrade_signal = httpflv::QualityUpgradeSignal::default();
     let file = |ext: &'static str| {
         let productive = &productive;
         LifecycleFile::with_hook_and_close_handle(
@@ -333,6 +552,8 @@ async fn record_once(
         )
         .with_owner(owner.clone())
         .with_title(stream.title.clone())
+        .with_tz_offset(config.tz_offset)
+        .with_pace(config.pace.clone())
         .with_open_hook(move |event| {
             // 转正后第一个正式分段：FLV 切段时已带推流时刻记过；HLS、转正后重连的新连接在这里记，不知道时刻。
             if let Some(pace) =
@@ -349,65 +570,160 @@ async fn record_once(
     let url = stream.raw_stream_url.as_str();
 
     let download = async {
-        if matches!(media_ext_from_url(url).as_deref(), Some("m3u8" | "ts")) {
-            return hls_download(
-                url,
-                &client,
-                file("ts"),
-                segment,
-                &productive,
-                pace,
-                progress,
-            )
-            .await;
-        }
-        client
-            .headers
-            .append(ACCEPT_ENCODING, HeaderValue::from_static("gzip, deflate"));
-        let response = client
-            .retryable(url)
-            .await
-            .map_err(|e| e.without_url().to_string())?;
-        let mut connection = Connection::with_stall_timeout(response, config.stall_timeout)
-            .with_pace(config.pace.clone());
-        let head = connection.read_frame(9).await.map_err(|e| e.to_string())?;
-        if header(&head).is_err() {
-            warn!(
-                room = stream.name,
-                "response is not FLV, falling back to HLS"
-            );
-            return hls_download(
-                url,
-                &client,
-                file("ts"),
-                segment,
-                &productive,
-                pace,
-                progress,
-            )
-            .await;
-        }
+        let mut connection = if let Some(mut conn) = preopened {
+            conn.set_pace(config.pace.clone());
+            conn
+        } else {
+            if matches!(media_ext_from_url(url).as_deref(), Some("m3u8" | "ts")) {
+                return hls_download(
+                    url,
+                    &client,
+                    file("ts"),
+                    segment,
+                    &productive,
+                    pace,
+                    progress,
+                )
+                .await;
+            }
+            client
+                .headers
+                .append(ACCEPT_ENCODING, HeaderValue::from_static("gzip, deflate"));
+            let response = client
+                .retryable(url)
+                .await
+                .map_err(|e| e.without_url().to_string())?;
+            let mut connection = Connection::with_stall_timeout(response, config.stall_timeout)
+                .with_pace(config.pace.clone());
+            let head = connection.read_frame(9).await.map_err(|e| e.to_string())?;
+            if header(&head).is_err() {
+                warn!(
+                    room = stream.name,
+                    "response is not FLV, falling back to HLS"
+                );
+                return hls_download(
+                    url,
+                    &client,
+                    file("ts"),
+                    segment,
+                    &productive,
+                    pace,
+                    progress,
+                )
+                .await;
+            }
+            connection
+        };
         started.store(true, Ordering::Relaxed);
+        flv_started.store(true, Ordering::Release);
+        flv_started_notify.notify_one();
         if let Some(pace) = pace {
             pace.mark_connected();
         }
         let _wall = pace.map(Pace::running);
-        httpflv::download_with_progress(&mut connection, file("flv"), segment, progress)
-            .await
-            .map_err(|e| e.to_string())
+        httpflv::download_with_progress_and_upgrade(
+            &mut connection,
+            file("flv"),
+            segment,
+            progress,
+            Some(&upgrade_signal),
+        )
+        .await
+        .map_err(|e| e.to_string())
     };
     tokio::pin!(download);
-    // 取消时先记下原因：写盘循环看到它就在下一个关键帧收尾（换机交接靠这个不丢尾巴）。
-    // FLV 已启动或 HLS 已拿到媒体时给 STOP_GRACE 收尾；超时直接丢弃 future，drop 同样标为 user_cancel。
-    let result = tokio::select! {
-        result = &mut download => result,
-        _ = cancel.cancelled() => {
-            close_handle.set(SegmentCloseReason::Cancelled);
-            if started.load(Ordering::Relaxed) || productive.load(Ordering::Relaxed) {
-                tokio::time::timeout(STOP_GRACE, &mut download).await.unwrap_or(Ok(()))
-            } else {
-                Ok(())
+
+    let mut recheck_ctx = recheck;
+    let mut upgraded_to: Option<ReadyCandidate> = None;
+    let result = loop {
+        let candidate_opt = if let Some((plugin, request, session_started_at, next_at)) =
+            recheck_ctx.as_mut()
+            && quality_upgrade_needed(stream, config).is_some()
+        {
+            let wait_and_probe = async {
+                if !flv_started.load(Ordering::Acquire) {
+                    flv_started_notify.notified().await;
+                }
+                loop {
+                    let target = *next_at.get_or_insert_with(|| {
+                        let now = tokio::time::Instant::now();
+                        now + next_quality_recheck_delay(*session_started_at, now)
+                    });
+                    tokio::time::sleep_until(target).await;
+                    let candidate =
+                        if is_formal_recording(config) && pace.and_then(Pace::cut_live).is_none() {
+                            probe_upgrade_candidate(stream, config, *plugin, *request).await
+                        } else {
+                            None
+                        };
+                    let now = tokio::time::Instant::now();
+                    **next_at = Some(now + next_quality_recheck_delay(*session_started_at, now));
+                    if let Some(candidate) = candidate {
+                        return candidate;
+                    }
+                }
+            };
+            tokio::select! {
+                result = &mut download => break result,
+                _ = cancel.cancelled() => {
+                    close_handle.set(SegmentCloseReason::Cancelled);
+                    break if started.load(Ordering::Relaxed) || productive.load(Ordering::Relaxed) {
+                        tokio::time::timeout(STOP_GRACE, &mut download).await.unwrap_or(Ok(()))
+                    } else {
+                        Ok(())
+                    };
+                }
+                candidate = wait_and_probe => Some(candidate),
             }
+        } else {
+            tokio::select! {
+                result = &mut download => break result,
+                _ = cancel.cancelled() => {
+                    close_handle.set(SegmentCloseReason::Cancelled);
+                    break if started.load(Ordering::Relaxed) || productive.load(Ordering::Relaxed) {
+                        tokio::time::timeout(STOP_GRACE, &mut download).await.unwrap_or(Ok(()))
+                    } else {
+                        Ok(())
+                    };
+                }
+            }
+        };
+
+        if let Some(candidate) = candidate_opt {
+            upgrade_signal.request();
+            let mut handover_result: Option<Result<(), String>> = None;
+            let handover_ok = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    let _ = upgrade_signal.cancel();
+                    close_handle.set(SegmentCloseReason::Cancelled);
+                    handover_result = Some(
+                        if started.load(Ordering::Relaxed) || productive.load(Ordering::Relaxed) {
+                            tokio::time::timeout(STOP_GRACE, &mut download).await.unwrap_or(Ok(()))
+                        } else {
+                            Ok(())
+                        }
+                    );
+                    false
+                }
+                _ = tokio::time::sleep(QUALITY_HANDOVER_GRACE) => {
+                    let _ = upgrade_signal.cancel();
+                    false
+                }
+                res = &mut download => {
+                    let acked = upgrade_signal.acknowledged() && res.is_ok();
+                    handover_result = Some(res);
+                    acked
+                }
+            };
+            if handover_ok {
+                upgraded_to = Some(candidate);
+                break handover_result.unwrap_or(Ok(()));
+            }
+            if let Some(res) = handover_result {
+                break res;
+            }
+            // 5 秒超时旧流仍存活：已取消信号并释放候选，继续旧流。
         }
     };
     if let Err(e) = result {
@@ -417,7 +733,10 @@ async fn record_once(
             "download attempt ended with error"
         );
     }
-    productive.load(Ordering::Relaxed)
+    RecordOnceOutcome {
+        productive: productive.load(Ordering::Relaxed),
+        upgraded_to,
+    }
 }
 
 async fn hls_download(
@@ -721,6 +1040,7 @@ mod tests {
                 stream_headers: Default::default(),
                 suffix: "flv".into(),
                 recording_quality: None,
+                recording_quality_code: None,
                 live_session_key: None,
             };
             let config = RecordConfig {
@@ -1537,6 +1857,7 @@ mod tests {
                         stream_headers: Default::default(),
                         suffix: "flv".into(),
                         recording_quality: None,
+                        recording_quality_code: None,
                         live_session_key: Some(key.into()),
                     }),
                 },
@@ -1815,5 +2136,639 @@ mod tests {
             output_template("rec/{name}_{title}_%H", "a/b", "100% 好"),
             "rec/a_b_100%% 好_%H"
         );
+    }
+
+    fn append_test_flv_tag(bytes: &mut Vec<u8>, tag_type: u8, body: &[u8], timestamp: u32) {
+        bytes.push(tag_type);
+        bytes.extend_from_slice(&[
+            ((body.len() >> 16) & 0xff) as u8,
+            ((body.len() >> 8) & 0xff) as u8,
+            (body.len() & 0xff) as u8,
+            ((timestamp >> 16) & 0xff) as u8,
+            ((timestamp >> 8) & 0xff) as u8,
+            (timestamp & 0xff) as u8,
+            ((timestamp >> 24) & 0xff) as u8,
+            0,
+            0,
+            0,
+        ]);
+        bytes.extend_from_slice(body);
+        bytes.extend_from_slice(&((11 + body.len()) as u32).to_be_bytes());
+    }
+
+    fn test_flv_prelude() -> Vec<u8> {
+        let mut bytes = vec![b'F', b'L', b'V', 1, 5, 0, 0, 0, 9, 0, 0, 0, 0];
+        let mut metadata = vec![0x02, 0x00, 0x0a];
+        metadata.extend_from_slice(b"onMetaData");
+        metadata.push(0x05);
+        append_test_flv_tag(&mut bytes, 18, &metadata, 0);
+        append_test_flv_tag(&mut bytes, 8, &[0xaf, 0x00, 0x12, 0x10], 0);
+        append_test_flv_tag(&mut bytes, 9, &[0x17, 0x00, 0, 0, 0, 0x01, 0x64, 0x00], 0);
+        bytes
+    }
+
+    fn test_flv_keyframe(timestamp: u32, payload: usize) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut frame = vec![0x17, 0x01, 0, 0, 0];
+        frame.resize(5 + payload, 0x41);
+        append_test_flv_tag(&mut bytes, 9, &frame, timestamp);
+        bytes
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn douyin_flv_upgrades_quality_from_sd_to_origin() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let sd_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sd_addr = sd_listener.local_addr().unwrap();
+        let origin_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_addr = origin_listener.local_addr().unwrap();
+
+        let origin_requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let origin_requests_srv = origin_requests.clone();
+        let (origin_ready_tx, mut origin_ready_rx) = tokio::sync::oneshot::channel::<()>();
+        let (continue_origin_tx, continue_origin_rx) = tokio::sync::oneshot::channel::<()>();
+        let recording_dir = dir.path().to_path_buf();
+
+        let sd_server = tokio::spawn(async move {
+            let (mut socket, _) = sd_listener.accept().await.unwrap();
+            let mut req = [0u8; 4096];
+            let _ = socket.read(&mut req).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: video/x-flv\r\n\r\n")
+                .await
+                .unwrap();
+            let mut init = test_flv_prelude();
+            init.extend_from_slice(&test_flv_keyframe(1_000, 16));
+            init.extend_from_slice(&test_flv_keyframe(2_000, 16));
+            socket.write_all(&init).await.unwrap();
+            let mut ts = 3_000u32;
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if socket
+                    .write_all(&test_flv_keyframe(ts, 4_096))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                ts += 1_000;
+            }
+        });
+
+        let origin_server = tokio::spawn(async move {
+            let (mut socket, _) = origin_listener.accept().await.unwrap();
+            origin_requests_srv.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut req = [0u8; 4096];
+            let _ = socket.read(&mut req).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: video/x-flv\r\n\r\n")
+                .await
+                .unwrap();
+            socket.write_all(&test_flv_prelude()).await.unwrap();
+            let old_recorded_bytes = || {
+                std::fs::read_dir(&recording_dir)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().metadata().unwrap().len())
+                    .sum::<u64>()
+            };
+            let before_probe = old_recorded_bytes();
+            tokio::time::timeout(Duration::from_secs(6), async {
+                while old_recorded_bytes() <= before_probe {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await
+            .expect("候选缺关键帧期间旧文件仍应增长");
+            socket
+                .write_all(&test_flv_keyframe(10_000, 32))
+                .await
+                .unwrap();
+            origin_ready_tx.send(()).unwrap();
+            continue_origin_rx.await.unwrap();
+            let mut ts = 11_000u32;
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if socket.write_all(&test_flv_keyframe(ts, 32)).await.is_err() {
+                    break;
+                }
+                ts += 1_000;
+            }
+        });
+
+        struct UpgradePlugin {
+            calls: std::sync::atomic::AtomicUsize,
+            sd_url: String,
+            origin_url: String,
+        }
+        #[async_trait::async_trait]
+        impl LivePlugin for UpgradePlugin {
+            fn name(&self) -> &'static str {
+                "douyin"
+            }
+            fn matches(&self, _: &str) -> bool {
+                true
+            }
+            async fn check_stream(
+                &self,
+                _: LiveRequest,
+            ) -> crate::downloader::live::LiveResult<LiveStatus> {
+                let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let (url, quality, code) = if n == 0 {
+                    (self.sd_url.clone(), "高清", "sd")
+                } else {
+                    (self.origin_url.clone(), "原画", "origin")
+                };
+                Ok(LiveStatus::Live {
+                    stream: Box::new(LiveStream {
+                        name: "r".into(),
+                        url: "https://live.douyin.com/1".into(),
+                        title: "t".into(),
+                        raw_stream_url: url,
+                        platform: "douyin".into(),
+                        stream_headers: Default::default(),
+                        suffix: "flv".into(),
+                        recording_quality: Some(quality.into()),
+                        recording_quality_code: Some(code.into()),
+                        live_session_key: Some("sess-1".into()),
+                    }),
+                })
+            }
+        }
+
+        let plugin = Arc::new(UpgradePlugin {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            sd_url: format!("http://{sd_addr}/sd.flv?sign=secret"),
+            origin_url: format!("http://{origin_addr}/origin.flv?sign=secret"),
+        });
+        let pace = Arc::new(Pace::default());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = Arc::new(RecordConfig {
+            output: dir.path().join("seg_%Y%m%d_%H%M%S").display().to_string(),
+            events: Some(tx),
+            pace: Some(pace.clone()),
+            offline_grace: Duration::ZERO,
+            ..Default::default()
+        });
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(watch_room(
+            plugin.clone(),
+            "r".into(),
+            "https://live.douyin.com/1".into(),
+            config,
+            cancel.clone(),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                tokio::select! {
+                    result = &mut origin_ready_rx => break result.unwrap(),
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                }
+            }
+        })
+        .await
+        .expect("候选应取得关键帧");
+        assert_eq!(pace.quality().as_deref(), Some("高清"));
+        continue_origin_tx.send(()).unwrap();
+
+        let mut closed_reasons = Vec::new();
+        let mut opened_sessions = Vec::new();
+        tokio::time::timeout(Duration::from_secs(90), async {
+            while pace.quality().as_deref() != Some("原画") {
+                while let Ok(ev) = rx.try_recv() {
+                    match ev {
+                        Event::PartOpened(p) => opened_sessions.push(p.owner.session),
+                        Event::PartClosed(p) => closed_reasons.push(p.reason),
+                        _ => {}
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("应在升档后把 Pace 画质更新为原画");
+
+        cancel.cancel();
+        let _ = task.await;
+        sd_server.abort();
+        origin_server.abort();
+
+        assert_eq!(origin_requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(opened_sessions.len() >= 2);
+        assert!(opened_sessions.iter().all(|s| s == "sess-1"));
+        assert_eq!(
+            closed_reasons.first().copied(),
+            Some(SegmentCloseReason::Unknown)
+        );
+        assert_eq!(pace.record_failures(), (0, false));
+        assert!(pace.recent_connections(0).is_empty());
+        assert!(pace.recent_gaps(0).is_empty());
+    }
+
+    fn douyin_stream(code: &str, quality: &str, session: Option<&str>, url: &str) -> LiveStream {
+        LiveStream {
+            name: "r".into(),
+            url: "https://live.douyin.com/1".into(),
+            title: "t".into(),
+            raw_stream_url: url.into(),
+            platform: "douyin".into(),
+            stream_headers: Default::default(),
+            suffix: "flv".into(),
+            recording_quality: Some(quality.into()),
+            recording_quality_code: Some(code.into()),
+            live_session_key: session.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn quality_recheck_eligibility_and_candidate_filters() {
+        let pace = Arc::new(Pace::default());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let formal_cfg = RecordConfig {
+            events: Some(tx.clone()),
+            pace: Some(pace.clone()),
+            ..Default::default()
+        };
+        assert!(is_formal_recording(&formal_cfg));
+        assert!(!is_formal_recording(&RecordConfig::default()));
+
+        let staging_cfg = RecordConfig {
+            events: Some(tx),
+            pace: Some(pace.clone()),
+            staging: Some("/tmp/staging".into()),
+            ..Default::default()
+        };
+        assert!(!is_formal_recording(&staging_cfg));
+        pace.formal_started(None);
+        assert!(is_formal_recording(&staging_cfg));
+
+        let cur_origin = douyin_stream("origin", "原画", Some("s1"), "http://a/o.flv");
+        assert!(quality_upgrade_needed(&cur_origin, &formal_cfg).is_none());
+
+        let cur_sd = douyin_stream("sd", "高清", Some("s1"), "http://a/sd.flv");
+        assert!(quality_upgrade_needed(&cur_sd, &formal_cfg).is_some());
+
+        // 候选过滤：接受 sd -> hd/origin（<= 请求档）
+        let cand_hd = douyin_stream("hd", "超清", Some("s1"), "http://a/hd.flv");
+        let cand_origin = douyin_stream("origin", "原画", Some("s1"), "http://a/o.flv");
+        let cand_sd = douyin_stream("sd", "高清", Some("s1"), "http://a/sd2.flv");
+        let cand_ld = douyin_stream("ld", "标清", Some("s1"), "http://a/ld.flv");
+        let cand_other_sess = douyin_stream("origin", "原画", Some("s2"), "http://a/o.flv");
+        let cand_no_sess = douyin_stream("origin", "原画", None, "http://a/o.flv");
+        let cand_hls = douyin_stream("origin", "原画", Some("s1"), "http://a/o.m3u8");
+
+        assert!(is_eligible_upgrade_candidate(&cur_sd, &cand_hd, "origin"));
+        assert!(is_eligible_upgrade_candidate(
+            &cur_sd,
+            &cand_origin,
+            "origin"
+        ));
+        assert!(!is_eligible_upgrade_candidate(&cur_sd, &cand_origin, "hd"));
+        assert!(!is_eligible_upgrade_candidate(&cur_sd, &cand_sd, "origin"));
+        assert!(!is_eligible_upgrade_candidate(&cur_sd, &cand_ld, "origin"));
+        assert!(!is_eligible_upgrade_candidate(
+            &cur_sd,
+            &cand_other_sess,
+            "origin"
+        ));
+        assert!(!is_eligible_upgrade_candidate(
+            &cur_sd,
+            &cand_no_sess,
+            "origin"
+        ));
+        assert!(!is_eligible_upgrade_candidate(&cur_sd, &cand_hls, "origin"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn douyin_flv_steps_up_through_multiple_qualities_to_target() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn spawn_flv_server() -> (String, tokio::task::JoinHandle<()>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let handle = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut req = [0u8; 4096];
+                let _ = socket.read(&mut req).await.unwrap();
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: video/x-flv\r\n\r\n")
+                    .await
+                    .unwrap();
+                let mut init = test_flv_prelude();
+                init.extend_from_slice(&test_flv_keyframe(1_000, 16));
+                init.extend_from_slice(&test_flv_keyframe(2_000, 16));
+                socket.write_all(&init).await.unwrap();
+                let mut ts = 3_000u32;
+                loop {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    if socket.write_all(&test_flv_keyframe(ts, 16)).await.is_err() {
+                        break;
+                    }
+                    ts += 1_000;
+                }
+            });
+            (format!("http://{addr}/live.flv"), handle)
+        }
+
+        let (sd_url, sd_srv) = spawn_flv_server().await;
+        let (hd_url, hd_srv) = spawn_flv_server().await;
+        let (origin_url, origin_srv) = spawn_flv_server().await;
+
+        struct StepPlugin {
+            calls: std::sync::atomic::AtomicUsize,
+            urls: Vec<(String, &'static str, &'static str)>,
+        }
+        #[async_trait::async_trait]
+        impl LivePlugin for StepPlugin {
+            fn name(&self) -> &'static str {
+                "douyin"
+            }
+            fn matches(&self, _: &str) -> bool {
+                true
+            }
+            async fn check_stream(
+                &self,
+                _: LiveRequest,
+            ) -> crate::downloader::live::LiveResult<LiveStatus> {
+                let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let (url, q, c) = &self.urls[n.min(self.urls.len() - 1)];
+                Ok(LiveStatus::Live {
+                    stream: Box::new(douyin_stream(c, q, Some("sess-step"), url)),
+                })
+            }
+        }
+
+        let plugin = Arc::new(StepPlugin {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            urls: vec![
+                (sd_url, "高清", "sd"),
+                (hd_url, "超清", "hd"),
+                (origin_url, "原画", "origin"),
+            ],
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let pace = Arc::new(Pace::default());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = Arc::new(RecordConfig {
+            output: dir.path().join("seg_%Y%m%d_%H%M%S").display().to_string(),
+            events: Some(tx),
+            pace: Some(pace.clone()),
+            offline_grace: Duration::ZERO,
+            ..Default::default()
+        });
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(watch_room(
+            plugin.clone(),
+            "r".into(),
+            "https://live.douyin.com/1".into(),
+            config,
+            cancel.clone(),
+        ));
+
+        tokio::time::timeout(Duration::from_secs(50), async {
+            while pace.quality().as_deref() != Some("超清") {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("应先升到超清");
+
+        tokio::time::timeout(Duration::from_secs(50), async {
+            while pace.quality().as_deref() != Some("原画") {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("应继续升到原画");
+
+        // 达到目标后不再复查
+        let calls_at_origin = plugin.calls.load(std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(70)).await;
+        assert_eq!(
+            plugin.calls.load(std::sync::atomic::Ordering::SeqCst),
+            calls_at_origin
+        );
+
+        cancel.cancel();
+        let _ = task.await;
+        sd_srv.abort();
+        hd_srv.abort();
+        origin_srv.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn douyin_flv_probe_failures_and_handover_timeout_keep_old_stream() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let sd_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sd_addr = sd_listener.local_addr().unwrap();
+        let stop_keyframes = Arc::new(AtomicBool::new(false));
+        let stop_kf_srv = stop_keyframes.clone();
+        let sd_srv = tokio::spawn(async move {
+            let (mut socket, _) = sd_listener.accept().await.unwrap();
+            let mut req = [0u8; 4096];
+            let _ = socket.read(&mut req).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: video/x-flv\r\n\r\n")
+                .await
+                .unwrap();
+            let mut init = test_flv_prelude();
+            init.extend_from_slice(&test_flv_keyframe(1_000, 16));
+            init.extend_from_slice(&test_flv_keyframe(2_000, 16));
+            socket.write_all(&init).await.unwrap();
+            let mut ts = 3_000u32;
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if stop_kf_srv.load(Ordering::Relaxed) {
+                    // 发送音频帧保持连接存活但不给关键帧，触发 5s 交接超时
+                    let mut audio = Vec::new();
+                    append_test_flv_tag(&mut audio, 8, &[0xaf, 0x01, 0x11], ts);
+                    if socket.write_all(&audio).await.is_err() {
+                        break;
+                    }
+                } else if socket.write_all(&test_flv_keyframe(ts, 16)).await.is_err() {
+                    break;
+                }
+                ts += 1_000;
+            }
+        });
+
+        let bad_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bad_addr = bad_listener.local_addr().unwrap();
+        let bad_srv = tokio::spawn(async move {
+            let (mut socket, _) = bad_listener.accept().await.unwrap();
+            let mut req = [0u8; 1024];
+            let _ = socket.read(&mut req).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\n\r\nNOT_FLV")
+                .await
+                .unwrap();
+        });
+
+        let ok_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ok_addr = ok_listener.local_addr().unwrap();
+        let ok_srv = tokio::spawn(async move {
+            let (mut socket, _) = ok_listener.accept().await.unwrap();
+            let mut req = [0u8; 1024];
+            let _ = socket.read(&mut req).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: video/x-flv\r\n\r\n")
+                .await
+                .unwrap();
+            let mut body = test_flv_prelude();
+            body.extend_from_slice(&test_flv_keyframe(1_000, 32));
+            socket.write_all(&body).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(20)).await;
+        });
+
+        struct FailThenTimeoutPlugin {
+            calls: std::sync::atomic::AtomicUsize,
+            sd_url: String,
+            bad_url: String,
+            ok_url: String,
+            stop_kf: Arc<AtomicBool>,
+        }
+        #[async_trait::async_trait]
+        impl LivePlugin for FailThenTimeoutPlugin {
+            fn name(&self) -> &'static str {
+                "douyin"
+            }
+            fn matches(&self, _: &str) -> bool {
+                true
+            }
+            async fn check_stream(
+                &self,
+                _: LiveRequest,
+            ) -> crate::downloader::live::LiveResult<LiveStatus> {
+                let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let (url, q, c) = match n {
+                    0 => (self.sd_url.clone(), "高清", "sd"),
+                    1 => (self.bad_url.clone(), "原画", "origin"),
+                    _ => {
+                        self.stop_kf.store(true, Ordering::Relaxed);
+                        (self.ok_url.clone(), "原画", "origin")
+                    }
+                };
+                Ok(LiveStatus::Live {
+                    stream: Box::new(douyin_stream(c, q, Some("sess-t"), &url)),
+                })
+            }
+        }
+
+        let plugin = Arc::new(FailThenTimeoutPlugin {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            sd_url: format!("http://{sd_addr}/sd.flv"),
+            bad_url: format!("http://{bad_addr}/bad.flv"),
+            ok_url: format!("http://{ok_addr}/ok.flv"),
+            stop_kf: stop_keyframes.clone(),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let pace = Arc::new(Pace::default());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let config = Arc::new(RecordConfig {
+            output: dir.path().join("seg_%Y%m%d_%H%M%S").display().to_string(),
+            events: Some(tx),
+            pace: Some(pace.clone()),
+            offline_grace: Duration::ZERO,
+            ..Default::default()
+        });
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(watch_room(
+            plugin.clone(),
+            "r".into(),
+            "https://live.douyin.com/1".into(),
+            config,
+            cancel.clone(),
+        ));
+
+        // 经过 1 次坏 FLV 复查 + 1 次就绪但旧流 5s 无关键帧超时
+        tokio::time::timeout(Duration::from_secs(120), async {
+            while plugin.calls.load(std::sync::atomic::Ordering::SeqCst) < 3 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("应完成坏 FLV 复查并触发下一次复查");
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert!(plugin.calls.load(std::sync::atomic::Ordering::SeqCst) >= 3);
+        assert_eq!(pace.quality().as_deref(), Some("高清"));
+
+        cancel.cancel();
+        let _ = task.await;
+        sd_srv.abort();
+        bad_srv.abort();
+        ok_srv.abort();
+    }
+
+    #[tokio::test]
+    async fn pace_cut_takes_priority_over_quality_upgrade_signal() {
+        let dir = tempfile::tempdir().unwrap();
+        let pace = Arc::new(Pace::default());
+        // 设置极小的 cut_live_ms，确保下一个关键帧命中换机切点
+        pace.set_cut_live(1_000);
+        let upgrade_signal = httpflv::QualityUpgradeSignal::default();
+        upgrade_signal.request();
+
+        let mut flv_bytes = test_flv_prelude();
+        // 带 SEI 的关键帧（ts=1700000000000 > cut_live_ms）
+        let sei = b"{\"ts\":1700000000000}";
+        let mut nal = Vec::new();
+        nal.extend_from_slice(&((1 + sei.len()) as u32).to_be_bytes());
+        nal.push(0x06);
+        nal.extend_from_slice(sei);
+        let mut frame = vec![0x17, 0x01, 0, 0, 0];
+        frame.extend_from_slice(&nal);
+        append_test_flv_tag(&mut flv_bytes, 9, &frame, 1_000);
+        append_test_flv_tag(&mut flv_bytes, 9, &frame, 2_000);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut req = [0u8; 1024];
+            let _ = socket.read(&mut req).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: video/x-flv\r\n\r\n")
+                .await
+                .unwrap();
+            socket.write_all(&flv_bytes).await.unwrap();
+        });
+
+        let client = StatelessClient::new(HeaderMap::new());
+        let resp = client
+            .retryable(&format!("http://{addr}/live.flv"))
+            .await
+            .unwrap();
+        let mut conn = Connection::new(resp).with_pace(Some(pace.clone()));
+        let _head = conn.read_frame(9).await.unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let template = dir.path().join("cut").display().to_string();
+        let file = LifecycleFile::with_hook(&template, "flv", move |ev| {
+            let _ = tx.send(ev.reason);
+        })
+        .with_owner(RecordingOwner {
+            room: "r".into(),
+            session: "s".into(),
+        });
+        let segment = Segmentable::new(None, None).with_pace(Some(pace.clone()));
+        let mut progress = httpflv::FlvProgress::default();
+        httpflv::download_with_progress_and_upgrade(
+            &mut conn,
+            file,
+            segment,
+            &mut progress,
+            Some(&upgrade_signal),
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+
+        assert!(!upgrade_signal.acknowledged());
+        assert!(pace.cut_done());
+        assert_eq!(rx.try_recv().ok(), Some(SegmentCloseReason::Cancelled));
     }
 }

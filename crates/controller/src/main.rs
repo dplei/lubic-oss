@@ -15,7 +15,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use chrono::{Local, TimeZone};
+use chrono::{FixedOffset, TimeZone, Utc};
 use clap::{Parser, Subcommand};
 use lubic::downloader::live::{LivePlugin, LiveRequest, LiveStatus, builtin_plugins};
 use lubic_account::{Account, Poll, Save, Studio, SubmitError, Submitted, Via, Video};
@@ -77,6 +77,10 @@ struct Config {
     listen: SocketAddr,
     /// SQLite 数据库：房间、模板、投稿账号的 cookie 与运行状态都在里面，别入库。
     db: PathBuf,
+    /// 总控统一时区偏移（`±HH:MM`、`±HHMM` 或 `Z`），默认 `+08:00`。
+    /// 统一用于投稿标题/封面、控制台时间显示，并下发给各 agent 渲染录像文件名。
+    #[serde(default = "default_timezone")]
+    timezone: String,
     /// 控制台管理员密码的 argon2 哈希（`hash-password` 子命令生成）。不配则控制台不可用。
     admin_password_hash: Option<String>,
     /// agent 多久没来就算失联：不再分给它，已分给它的在播房间改派。
@@ -127,6 +131,39 @@ fn default_poll() -> Duration {
 }
 fn default_limited_for() -> Duration {
     Duration::from_secs(3600)
+}
+fn default_timezone() -> String {
+    "+08:00".into()
+}
+
+/// 解析固定 UTC 偏移：`±HH:MM`、`±HHMM` 或 `Z`/`z`。
+pub(crate) fn parse_timezone(s: &str) -> Result<FixedOffset, String> {
+    let err = || format!("invalid timezone {s:?}: expected ±HH:MM, ±HHMM or Z");
+    if s == "Z" || s == "z" {
+        return Ok(FixedOffset::east_opt(0).unwrap());
+    }
+    let bytes = s.as_bytes();
+    let (sign, hh, mm) = match bytes {
+        [sign @ (b'+' | b'-'), h1, h2, b':', m1, m2] | [sign @ (b'+' | b'-'), h1, h2, m1, m2] => {
+            (*sign, [*h1, *h2], [*m1, *m2])
+        }
+        _ => return Err(err()),
+    };
+    if !hh.iter().chain(mm.iter()).all(u8::is_ascii_digit) {
+        return Err(err());
+    }
+    let hours = ((hh[0] - b'0') as i32) * 10 + (hh[1] - b'0') as i32;
+    let mins = ((mm[0] - b'0') as i32) * 10 + (mm[1] - b'0') as i32;
+    if hours > 23 || mins > 59 {
+        return Err(err());
+    }
+    let secs = hours * 3600 + mins * 60;
+    let offset = if sign == b'+' || secs == 0 {
+        FixedOffset::east_opt(secs)
+    } else {
+        FixedOffset::west_opt(secs)
+    };
+    offset.ok_or_else(err)
 }
 
 /// 录制实时倍率低于它就判受限（agent 报的是 2 分钟内各 30 秒子窗口的最高值，低于它即持续低了 2 分钟）。
@@ -334,6 +371,7 @@ impl Config {
 
     fn parse(text: &str) -> Result<Self, String> {
         let config: Self = toml::from_str(text).map_err(|e| e.to_string())?;
+        parse_timezone(&config.timezone)?;
         for room in &config.rooms {
             if room.tail_upload && room.split_size_mb.is_none() {
                 return Err(format!(
@@ -519,6 +557,8 @@ type MakeBili = Box<dyn Fn(Value, Save) -> Arc<dyn Bili> + Send + Sync>;
 
 struct App {
     config: Config,
+    /// 总控统一时区（由 `config.timezone` 解析而来）。
+    tz: FixedOffset,
     /// `Arc`：账号刷新令牌时经保存回调写回 `accounts.login`。
     db: Arc<Mutex<Connection>>,
     make_bili: MakeBili,
@@ -2019,9 +2059,9 @@ impl App {
             }) {
                 continue; // 同账号刚投过，下个周期再投
             }
-            let mut studio = render(&room, &tpl, &archive);
+            let mut studio = render(&room, &tpl, &archive, self.tz);
             let bg = db::cover_bg(&self.db(), &room.name)?;
-            studio.cover = upload_cover(&*bili, &room, &archive, bg.as_deref()).await;
+            studio.cover = upload_cover(&*bili, &room, &archive, bg.as_deref(), self.tz).await;
             if !db::begin_submit(&self.db(), id)? {
                 continue; // 准备期间在控制台丢弃了
             }
@@ -2220,8 +2260,9 @@ async fn upload_cover(
     room: &db::Room,
     archive: &db::Archive,
     bg: Option<&[u8]>,
+    tz: FixedOffset,
 ) -> String {
-    let started = local(archive.started_at)
+    let started = at_tz(archive.started_at, tz)
         .format(cover::TIME_FORMAT)
         .to_string();
     let jpeg = cover::render(bg, &[room.display_name(), &started]);
@@ -2238,11 +2279,10 @@ async fn upload_cover(
     }
 }
 
-fn local(ms: i64) -> chrono::DateTime<Local> {
-    Local
-        .timestamp_millis_opt(ms)
+fn at_tz(ms: i64, tz: FixedOffset) -> chrono::DateTime<FixedOffset> {
+    tz.timestamp_millis_opt(ms)
         .single()
-        .unwrap_or_else(Local::now)
+        .unwrap_or_else(|| Utc::now().with_timezone(&tz))
 }
 
 async fn watch(
@@ -2300,6 +2340,7 @@ async fn watch(
                 .availability(&agent, now_ms(), None)
                 .map_err(internal)?
                 .hold_uploads,
+            tz_offset_secs: Some(app.tz.local_minus_utc()),
         };
         // agent 的暂停状态和应下发的不同（开关变了，控制台改完会叫醒这里）：立刻下发，不等长轮询挂满。
         let hold_changed = *held.get_or_insert(reply.hold_uploads) != reply.hold_uploads;
@@ -2549,9 +2590,11 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-/// 套投稿模板：`{name}`、`{title}`、`{url}` 与开播时间的 strftime；分P标题取录像文件名。
-fn render(room: &db::Room, tpl: &db::Template, archive: &db::Archive) -> Studio {
-    let started = local(archive.started_at);
+/// 套投稿模板：`{name}`、`{title}`、`{url}` 与开播时间的 strftime；
+/// 分P标题：分P录制时区与总控一致时沿用录像文件名（保留 `-1` 后缀与实时 `{title}`，避免 1 秒跨秒差），
+/// 不一致或旧 agent 未报时按目标时区与 `opened_at` 兜底重渲染。
+fn render(room: &db::Room, tpl: &db::Template, archive: &db::Archive, tz: FixedOffset) -> Studio {
+    let started = at_tz(archive.started_at, tz);
     let fill = |t: &str| {
         let t = t
             .replace("{name}", &archive.room.replace('%', "%%"))
@@ -2564,19 +2607,56 @@ fn render(room: &db::Room, tpl: &db::Template, archive: &db::Archive) -> Studio 
         }
         out
     };
+    let target_offset = tz.local_minus_utc();
+    let mut used_titles = std::collections::HashSet::new();
     let videos = archive
         .parts
         .iter()
-        .map(|(path, filename)| Video {
-            title: truncate(
-                Path::new(path)
+        .map(|part| {
+            let raw_title = if part.tz_offset == Some(target_offset) {
+                let stem = Path::new(&part.path)
                     .file_stem()
                     .and_then(|n| n.to_str())
-                    .unwrap_or("P"),
-                TITLE_MAX,
-            ),
-            filename: filename.clone(),
-            desc: String::new(),
+                    .unwrap_or("P")
+                    .to_string();
+                used_titles.insert(stem.clone());
+                stem
+            } else {
+                let fmt = if room.filename.is_empty() {
+                    "{streamer}_%Y-%m-%dT%H_%M_%S"
+                } else {
+                    &room.filename
+                };
+                let part_title = if part.title.is_empty() {
+                    &archive.title
+                } else {
+                    &part.title
+                };
+                let rendered_tpl =
+                    lubic::recorder::render_filename(fmt, room.display_name(), part_title);
+                let at = at_tz(part.opened_at, tz);
+                let mut base = String::new();
+                if std::fmt::Write::write_fmt(
+                    &mut base,
+                    format_args!("{}", at.format(&rendered_tpl)),
+                )
+                .is_err()
+                {
+                    base = rendered_tpl;
+                }
+                let mut title = base.clone();
+                let mut n = 0usize;
+                while !used_titles.insert(title.clone()) {
+                    n += 1;
+                    title = format!("{base}-{n}");
+                }
+                title
+            };
+            Video {
+                title: truncate(&raw_title, TITLE_MAX),
+                filename: part.filename.clone(),
+                desc: String::new(),
+            }
         })
         .collect();
     Studio {
@@ -2595,8 +2675,10 @@ fn render(room: &db::Room, tpl: &db::Template, archive: &db::Archive) -> Studio 
 }
 
 fn app(config: Config, conn: Connection, make_bili: MakeBili, qr: Box<dyn QrLogin>) -> Arc<App> {
+    let tz = parse_timezone(&config.timezone).expect("validated timezone");
     Arc::new(App {
         config,
+        tz,
         db: Arc::new(Mutex::new(conn)),
         make_bili,
         bilis: Mutex::default(),
@@ -4683,6 +4765,7 @@ pub mod tests {
             opened("p1", "s", 1),
             closed("p1", "s", 2),
             uploaded("p1"),
+            opened("p2", "s", 20),
             closed("p2", "s", 30),
             uploaded("p2"),
             ended("s", 40),
@@ -5452,8 +5535,10 @@ pub mod tests {
     async fn cover_uses_display_name_or_falls_back_to_room_name() {
         let (app, fake) = test_app();
         let started = 1_761_220_800_000; // 2025-10-23 20:00 +08:00
-        let time = local(started).format(cover::TIME_FORMAT).to_string();
-        assert!(time.ends_with("点场"), "{time}");
+        let time = at_tz(started, app.tz)
+            .format(cover::TIME_FORMAT)
+            .to_string();
+        assert_eq!(time, "2025-10-23 20点场");
         let submit = |session: &str, part: &str| {
             let evs = [
                 opened(part, session, started),
@@ -5974,5 +6059,195 @@ pub mod tests {
                 .unwrap();
             assert_eq!(reply.0.hold_uploads, hold, "{agent}");
         }
+    }
+
+    #[test]
+    fn parse_timezone_and_config_validation() {
+        assert_eq!(
+            parse_timezone("+08:00").unwrap().local_minus_utc(),
+            8 * 3600
+        );
+        assert_eq!(parse_timezone("+0800").unwrap().local_minus_utc(), 8 * 3600);
+        assert_eq!(
+            parse_timezone("-05:00").unwrap().local_minus_utc(),
+            -5 * 3600
+        );
+        assert_eq!(
+            parse_timezone("-0530").unwrap().local_minus_utc(),
+            -(5 * 3600 + 30 * 60)
+        );
+        assert_eq!(parse_timezone("Z").unwrap().local_minus_utc(), 0);
+        assert_eq!(parse_timezone("z").unwrap().local_minus_utc(), 0);
+        assert_eq!(parse_timezone("+00:00").unwrap().local_minus_utc(), 0);
+        assert_eq!(parse_timezone("-00:00").unwrap().local_minus_utc(), 0);
+        assert_eq!(
+            parse_timezone("+23:59").unwrap().local_minus_utc(),
+            23 * 3600 + 59 * 60
+        );
+        assert_eq!(
+            parse_timezone("-23:59").unwrap().local_minus_utc(),
+            -(23 * 3600 + 59 * 60)
+        );
+
+        for bad in [
+            "",
+            "UTC",
+            "Asia/Shanghai",
+            "+8:00",
+            "08:00",
+            "+24:00",
+            "-24:00",
+            "+08:60",
+            "+08:00:00",
+            "+080",
+            "+08:0a",
+        ] {
+            assert!(parse_timezone(bad).is_err(), "{bad:?} should fail");
+        }
+
+        let default_cfg = Config::parse(r#"db = "c.db""#).unwrap();
+        assert_eq!(default_cfg.timezone, "+08:00");
+
+        let custom_cfg = Config::parse("db = \"c.db\"\ntimezone = \"+09:00\"\n").unwrap();
+        assert_eq!(custom_cfg.timezone, "+09:00");
+
+        let err = Config::parse("db = \"c.db\"\ntimezone = \"Asia/Shanghai\"\n")
+            .err()
+            .unwrap();
+        assert!(err.contains("invalid timezone"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn watch_returns_configured_tz_offset_secs() {
+        let mut cfg = config();
+        cfg.timezone = "+09:00".into();
+        let (app, _, _) = test_apps(cfg);
+        assign(&app, "r", "a", now_ms());
+        let mut h = HeaderMap::new();
+        h.insert("authorization", "Bearer ta".parse().unwrap());
+        let req: Watch = serde_json::from_str(r#"{"rooms":[],"status":{}}"#).unwrap();
+        let reply = super::watch(State(app), h, Json(req)).await.unwrap();
+        assert_eq!(reply.0.tz_offset_secs, Some(9 * 3600));
+    }
+
+    #[test]
+    fn render_keeps_matching_tz_stem_and_rerenders_mismatched_or_missing_parts() {
+        let tz = parse_timezone("+08:00").unwrap();
+        // 2026-01-02 12:34:56 UTC => 2026-01-02 20:34:56 +08:00
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-01-02T12:34:56Z")
+            .unwrap()
+            .timestamp_millis();
+        let mut room = db::Room {
+            name: "room_a".into(),
+            url: "https://example.com/1".into(),
+            template_id: 1,
+            agents: vec!["node_a".into()],
+            split_time: None,
+            split_size_mb: None,
+            grace: None,
+            bili_qn: None,
+            douyin_quality: None,
+            tail_upload: false,
+            display_name: Some("主播A".into()),
+            filename: "{streamer} %Y-%m-%d %H{colon}%M{colon}%S {title}".into(),
+            season_section_id: None,
+            tag: String::new(),
+            deleted: false,
+        };
+        let tpl = db::Template {
+            title: "{name} %Y-%m-%d %H:%M {title}".into(),
+            desc: "开播 %H:%M".into(),
+            source: "{url} %Y".into(),
+            ..Default::default()
+        };
+        let archive = db::Archive {
+            room: "room_a".into(),
+            account_id: Some(1),
+            title: "主标题".into(),
+            started_at: ts,
+            parts: vec![
+                // 偏移一致：原样保留 file_stem（含 -1 后缀与原时间，不因 opened_at 重渲染）
+                db::ArchivePart {
+                    path: "/rec/主播A 2026-01-02 20:34:55 实时标题-1.flv".into(),
+                    filename: "f1".into(),
+                    opened_at: ts,
+                    tz_offset: Some(8 * 3600),
+                    title: "实时标题".into(),
+                },
+                // 旧 agent 未报（None）：按目标时区与 part.title 重渲染
+                db::ArchivePart {
+                    path: "/rec/wrong_utc_12_34_56.flv".into(),
+                    filename: "f2".into(),
+                    opened_at: ts,
+                    tz_offset: None,
+                    title: "分P标题".into(),
+                },
+                // 偏移不一致（UTC=0）且同秒同标题：重渲染后与上一段撞名，自动加 -1
+                db::ArchivePart {
+                    path: "/rec/wrong_utc_again.flv".into(),
+                    filename: "f3".into(),
+                    opened_at: ts,
+                    tz_offset: Some(0),
+                    title: "分P标题".into(),
+                },
+                // 同秒同标题第三段：自动加 -2
+                db::ArchivePart {
+                    path: "/rec/wrong_utc_third.flv".into(),
+                    filename: "f4".into(),
+                    opened_at: ts,
+                    tz_offset: Some(-5 * 3600),
+                    title: "分P标题".into(),
+                },
+                // part.title 为空时回退 archive.title
+                db::ArchivePart {
+                    path: "/rec/legacy_empty_title.flv".into(),
+                    filename: "f5".into(),
+                    opened_at: ts,
+                    tz_offset: None,
+                    title: String::new(),
+                },
+            ],
+        };
+
+        let studio = render(&room, &tpl, &archive, tz);
+        assert_eq!(studio.title, "room_a 2026-01-02 20:34 主标题");
+        assert_eq!(studio.desc, "开播 20:34");
+        assert_eq!(studio.source, "https://example.com/1 2026");
+        let titles: Vec<_> = studio.videos.iter().map(|v| v.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            [
+                "主播A 2026-01-02 20:34:55 实时标题-1",
+                "主播A 2026-01-02 20:34:56 分P标题",
+                "主播A 2026-01-02 20:34:56 分P标题-1",
+                "主播A 2026-01-02 20:34:56 分P标题-2",
+                "主播A 2026-01-02 20:34:56 主标题",
+            ]
+        );
+
+        // room.filename 为空时回退 `{streamer}_%Y-%m-%dT%H_%M_%S`，超长按 TITLE_MAX 截断。
+        room.filename = String::new();
+        room.display_name = Some("长".repeat(90));
+        let single = db::Archive {
+            room: "room_a".into(),
+            account_id: Some(1),
+            title: "主标题".into(),
+            started_at: ts,
+            parts: vec![db::ArchivePart {
+                path: "/rec/old.flv".into(),
+                filename: "f1".into(),
+                opened_at: ts,
+                tz_offset: None,
+                title: String::new(),
+            }],
+        };
+        let studio2 = render(&room, &tpl, &single, tz);
+        assert_eq!(studio2.videos[0].title.chars().count(), TITLE_MAX);
+        assert!(studio2.videos[0].title.ends_with("..."));
+
+        // 空模板回退的精确格式检查（短名不截断）。
+        room.display_name = Some("主播B".into());
+        let studio3 = render(&room, &tpl, &single, tz);
+        assert_eq!(studio3.videos[0].title, "主播B_2026-01-02T20_34_56");
     }
 }

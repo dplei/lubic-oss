@@ -159,6 +159,10 @@ pub struct Assignments {
     /// 总控要求暂停上传（「让出网络」，`load-balance.md` §3）。录制照常；旧总控不发为 false，旧 agent 不认识照常上传。
     #[serde(default)]
     pub hold_uploads: bool,
+    /// 总控配置的统一时区偏移（UTC 东偏秒数，如 `+08:00` 为 `28800`）。
+    /// 旧总控不发时为 `None`（agent 退回本机 `Local`）；旧 agent 忽略该字段。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tz_offset_secs: Option<i32>,
 }
 
 /// 录一个房间要的全部参数。
@@ -456,6 +460,51 @@ mod tests {
             serde_json::from_value::<OldPartClosed>(new)
                 .unwrap()
                 .part_id,
+            "p"
+        );
+    }
+
+    /// `Assignments::tz_offset_secs` 与 `PartOpened::tz_offset_secs`：旧报文缺省为 `None`，
+    /// 新报文旧端照常读（未知字段忽略）。
+    #[test]
+    fn tz_offset_secs_mixes_with_older_peers() {
+        let a: Assignments = serde_json::from_str(OLD_ASSIGNMENTS).unwrap();
+        assert_eq!(a.tz_offset_secs, None);
+        #[derive(Deserialize)]
+        struct OldAssignments {
+            rooms: Vec<RoomTask>,
+        }
+        let new = Assignments {
+            tz_offset_secs: Some(28800),
+            ..Default::default()
+        };
+        let text = serde_json::to_string(&new).unwrap();
+        assert!(text.contains(r#""tz_offset_secs":28800"#), "{text}");
+        let old: OldAssignments = serde_json::from_str(&text).unwrap();
+        assert!(old.rooms.is_empty());
+        assert_eq!(serde_json::from_str::<Assignments>(&text).unwrap(), new);
+
+        let old_open = r#"{"seq":1,"event":{"Recorder":{"event":{"PartOpened":{"owner":{"room":"r","session":"s"},"part_id":"p","path":"/a.flv.part","title":"t"}},"at":9}}}"#;
+        let e: Envelope = serde_json::from_str(old_open).unwrap();
+        let AgentEvent::Recorder {
+            event: Event::PartOpened(p),
+            ..
+        } = &e.event
+        else {
+            panic!()
+        };
+        assert_eq!(p.tz_offset_secs, None);
+        assert_eq!(serde_json::to_string(&e).unwrap(), old_open);
+        let mut p = p.clone();
+        p.tz_offset_secs = Some(32400);
+        let v = serde_json::to_value(&p).unwrap();
+        assert_eq!(v["tz_offset_secs"], 32400);
+        #[derive(Deserialize)]
+        struct OldPartOpened {
+            part_id: String,
+        }
+        assert_eq!(
+            serde_json::from_value::<OldPartOpened>(v).unwrap().part_id,
             "p"
         );
     }

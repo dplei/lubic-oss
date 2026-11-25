@@ -136,6 +136,9 @@ pub struct LiveStream {
     pub suffix: String,
     /// 平台实际选中的画质的显示名（如「超清」），由各平台插件按平台叫法生成。
     pub recording_quality: Option<String>,
+    /// 平台实际选中的画质代码（如 `"origin"`），未知或平台不提供时为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recording_quality_code: Option<String>,
     /// 标识「这一场直播」：同一场多次检测、跨进程重启都不变。多机接续录制时用它归并分段。
     pub live_session_key: Option<String>,
 }
@@ -179,7 +182,7 @@ pub fn media_ext_from_url(input: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::media_ext_from_url;
+    use super::{LiveStream, media_ext_from_url};
 
     #[test]
     fn media_ext_from_path_query_and_bare_string() {
@@ -193,5 +196,31 @@ mod tests {
         );
         assert_eq!(media_ext_from_url("https://a.b/live/x"), None);
         assert_eq!(media_ext_from_url("x.ts?y").as_deref(), Some("ts"));
+    }
+
+    #[test]
+    fn live_stream_serde_handles_missing_and_none_quality_code() {
+        let legacy_json = r#"{
+            "name": "room",
+            "url": "https://example.com/1",
+            "title": "t",
+            "raw_stream_url": "https://example.com/live.flv",
+            "platform": "douyin",
+            "stream_headers": {},
+            "suffix": "flv",
+            "recording_quality": "高清",
+            "live_session_key": "sess-1"
+        }"#;
+        let stream: LiveStream = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(stream.recording_quality_code, None);
+        let serialized = serde_json::to_string(&stream).unwrap();
+        assert!(!serialized.contains("recording_quality_code"));
+
+        let mut with_code = stream;
+        with_code.recording_quality_code = Some("sd".to_string());
+        let serialized_with_code = serde_json::to_string(&with_code).unwrap();
+        assert!(serialized_with_code.contains("\"recording_quality_code\":\"sd\""));
+        let roundtrip: LiveStream = serde_json::from_str(&serialized_with_code).unwrap();
+        assert_eq!(roundtrip.recording_quality_code.as_deref(), Some("sd"));
     }
 }

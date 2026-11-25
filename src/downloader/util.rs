@@ -1,4 +1,4 @@
-use chrono::Local;
+use chrono::{FixedOffset, Local, Utc};
 use lubic_events::{PartClosed, PartOpened};
 use rand::Rng;
 use std::fs::{self, File};
@@ -182,6 +182,9 @@ struct PaceInner {
     promoted: bool,
     /// 转正后已切到正式分段（见 [`Pace::formal_started`]）。
     formal: bool,
+    /// 运行中更新的时区偏移覆盖：`None` 表示沿用初始 `RecordConfig::tz_offset`，
+    /// `Some(tz)` 表示下一次新开分段 / 重连改用 `tz`（`Some(None)` 退回本机 `Local`）。
+    tz_offset: Option<Option<FixedOffset>>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -414,6 +417,15 @@ impl Pace {
 
     pub fn cut_done(&self) -> bool {
         self.0.lock().unwrap().cut_done
+    }
+
+    /// 运行中更新时区偏移：不打断当前分段，下一次新开分段 / 重连生效。
+    pub fn set_tz_offset(&self, tz: Option<FixedOffset>) {
+        self.0.lock().unwrap().tz_offset = Some(tz);
+    }
+
+    pub fn tz_offset(&self) -> Option<Option<FixedOffset>> {
+        self.0.lock().unwrap().tz_offset
     }
 
     /// 收到了一批字节（拉流连接每读到一块就调一次）。
@@ -666,6 +678,8 @@ pub struct LifecycleFile<'a> {
     opened_at: Option<Instant>,
     last_closed: Option<PartClosed>,
     relocation: Option<Relocation>,
+    tz_offset: Option<FixedOffset>,
+    pace: Option<Arc<Pace>>,
 }
 
 /// 返回 `Some(新模板)` 时，当前文件该收尾、之后的文件改用新模板（暂存录制转正）。
@@ -712,12 +726,26 @@ impl<'a> LifecycleFile<'a> {
             opened_at: None,
             last_closed: None,
             relocation: None,
+            tz_offset: None,
+            pace: None,
         }
     }
 
     /// 见 [`Relocation`]。
     pub fn with_relocation(mut self, relocation: Option<Relocation>) -> Self {
         self.relocation = relocation;
+        self
+    }
+
+    /// 文件名 strftime 渲染使用的时区偏移；`None` 走本机 `Local`。
+    pub fn with_tz_offset(mut self, tz_offset: Option<FixedOffset>) -> Self {
+        self.tz_offset = tz_offset;
+        self
+    }
+
+    /// 关联录制计数：用于读取运行中动态更新的时区偏移（[`Pace::set_tz_offset`]）。
+    pub fn with_pace(mut self, pace: Option<Arc<Pace>>) -> Self {
+        self.pace = pace;
         self
     }
 
@@ -768,7 +796,13 @@ impl<'a> LifecycleFile<'a> {
         }
         // 构建最终文件名。模板通常只精确到秒：同一秒内再建文件会与上一段同名，
         // finalize 的 rename 会静默覆盖上一段（dplei/biliup#88），所以撞名时追加序号。
-        let base = format_filename(&self.fmt_file_name);
+        let tz = self
+            .pace
+            .as_ref()
+            .and_then(|p| p.tz_offset())
+            .unwrap_or(self.tz_offset);
+        let used_offset = tz.unwrap_or_else(|| *Local::now().offset());
+        let base = format_filename_in(&self.fmt_file_name, Some(used_offset));
         self.file_name = format!("{base}.{}", self.extension);
         let mut n = 0;
         while Path::new(&self.file_name).exists()
@@ -798,6 +832,7 @@ impl<'a> LifecycleFile<'a> {
             part_id: identity.segment_id.clone(),
             path: self.path.clone(),
             title: self.title.clone(),
+            tz_offset_secs: Some(used_offset.local_minus_utc()),
         };
         segment_created(&opened, &identity);
         if let Some(hook) = &mut self.on_open {
@@ -935,9 +970,17 @@ impl Drop for SegmentWriter<'_> {
     }
 }
 
+/// 用指定时区（`None` 时走本机 `Local`）展开 strftime 模板（如 `%Y-%m-%d_%H-%M-%S`）。
+pub fn format_filename_in(file_name: &str, tz_offset: Option<FixedOffset>) -> String {
+    match tz_offset {
+        Some(tz) => Utc::now().with_timezone(&tz).format(file_name).to_string(),
+        None => Local::now().format(file_name).to_string(),
+    }
+}
+
 /// 用本地时间展开 strftime 模板（如 `%Y-%m-%d_%H-%M-%S`）。
 pub fn format_filename(file_name: &str) -> String {
-    Local::now().format(file_name).to_string()
+    format_filename_in(file_name, None)
 }
 
 #[cfg(test)]
@@ -1186,6 +1229,59 @@ mod tests {
         assert_eq!(
             file.fallback_reason(SegmentCloseReason::TransportError),
             SegmentCloseReason::Cancelled
+        );
+    }
+
+    #[test]
+    fn format_filename_in_and_part_opened_respect_tz_offset() {
+        let plus8 = FixedOffset::east_opt(8 * 3600).unwrap();
+        let minus5 = FixedOffset::west_opt(5 * 3600).unwrap();
+        assert_eq!(format_filename_in("demo_%:z", Some(plus8)), "demo_+08:00");
+        assert_eq!(format_filename_in("demo_%:z", Some(minus5)), "demo_-05:00");
+        let local_z = Local::now().format("%:z").to_string();
+        assert_eq!(
+            format_filename_in("demo_%:z", None),
+            format!("demo_{local_z}")
+        );
+        assert_eq!(format_filename("demo_%:z"), format!("demo_{local_z}"));
+
+        // LifecycleFile::create 使用指定偏移渲染文件名并记入 PartOpened.tz_offset_secs，
+        // 运行中通过 Pace::set_tz_offset 更新偏移后，下一次 create 生效。
+        let dir = tempfile::tempdir().unwrap();
+        let pace = Arc::new(Pace::default());
+        let opened = Arc::new(Mutex::new(Vec::<PartOpened>::new()));
+        let sink = opened.clone();
+        let mut file = LifecycleFile::new(dir.path().join("seg_%:z").to_str().unwrap(), "flv")
+            .with_tz_offset(Some(plus8))
+            .with_pace(Some(pace.clone()))
+            .with_open_hook(move |ev| sink.lock().unwrap().push(ev.clone()));
+        file.create().unwrap();
+        pace.set_tz_offset(Some(minus5));
+        file.create().unwrap();
+
+        let events = opened.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].tz_offset_secs, Some(8 * 3600));
+        assert!(
+            events[0]
+                .path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("seg_+08:00"),
+            "{:?}",
+            events[0].path
+        );
+        assert_eq!(events[1].tz_offset_secs, Some(-5 * 3600));
+        assert!(
+            events[1]
+                .path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("seg_-05:00"),
+            "{:?}",
+            events[1].path
         );
     }
 }

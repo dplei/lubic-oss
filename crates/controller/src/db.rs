@@ -240,6 +240,12 @@ const MIGRATION_20: &str = "
 ALTER TABLE machines ADD COLUMN yield_until INTEGER;
 ";
 
+/// 迁移 21（20 → 21）：分P记下建文件时的时区偏移与当时直播标题，用于投稿时按总控时区兜底重渲染分P标题。
+const MIGRATION_21: &str = "
+ALTER TABLE parts ADD COLUMN tz_offset INTEGER;
+ALTER TABLE parts ADD COLUMN title TEXT NOT NULL DEFAULT '';
+";
+
 /// 房间文件名模板的默认值，同 biliup 生产上的 `filename_prefix`。与迁移 4 的列默认值一致。
 pub const DEFAULT_FILENAME: &str = "{streamer} %Y-%m-%d %H{colon}%M{colon}%S";
 
@@ -248,7 +254,7 @@ fn default_filename() -> String {
 }
 
 /// 迁移 1 之后的各步，第 i 个把 `user_version` 从 i + 1 升到 i + 2。
-const LATER: [&str; 19] = [
+const LATER: [&str; 20] = [
     MIGRATION_2,
     MIGRATION_3,
     MIGRATION_4,
@@ -268,6 +274,7 @@ const LATER: [&str; 19] = [
     MIGRATION_18,
     MIGRATION_19,
     MIGRATION_20,
+    MIGRATION_21,
 ];
 const VERSION: i64 = LATER.len() as i64 + 1;
 const MACHINES_VERSION: i64 = 9;
@@ -1515,11 +1522,22 @@ pub fn apply(conn: &Connection, agent: &str, event: &AgentEvent) -> Result<()> {
     match event {
         AgentEvent::Recorder { event, at } => match event {
             Event::PartOpened(p) => {
-                part_seen(conn, agent, &p.owner, &p.part_id, &p.path, &p.title, *at)?;
+                part_seen(
+                    conn,
+                    agent,
+                    &p.owner,
+                    &p.part_id,
+                    &p.path,
+                    &p.title,
+                    *at,
+                    p.tz_offset_secs,
+                )?;
             }
             Event::PartClosed(p) => {
                 let opened = at - p.duration.as_millis() as i64;
-                part_seen(conn, agent, &p.owner, &p.part_id, &p.path, &p.title, opened)?;
+                part_seen(
+                    conn, agent, &p.owner, &p.part_id, &p.path, &p.title, opened, None,
+                )?;
                 conn.execute(
                     "UPDATE parts SET state = 'closed', path = ?2, size = ?3, closed_at = ?4
                      WHERE part_id = ?1 AND state = 'open'",
@@ -1528,7 +1546,9 @@ pub fn apply(conn: &Connection, agent: &str, event: &AgentEvent) -> Result<()> {
             }
             Event::PartDiscarded(p) => {
                 let opened = at - p.duration.as_millis() as i64;
-                part_seen(conn, agent, &p.owner, &p.part_id, &p.path, &p.title, opened)?;
+                part_seen(
+                    conn, agent, &p.owner, &p.part_id, &p.path, &p.title, opened, None,
+                )?;
                 conn.execute(
                     "UPDATE parts SET state = 'empty', size = ?2, closed_at = ?3
                      WHERE part_id = ?1 AND state = 'open'",
@@ -1605,6 +1625,7 @@ pub fn apply(conn: &Connection, agent: &str, event: &AgentEvent) -> Result<()> {
 }
 
 /// 第一次见到这个分P就登记，归入同一场次键下 `opened_at` 时还没结束的稿件，没有就开一份新的。
+#[allow(clippy::too_many_arguments)]
 fn part_seen(
     conn: &Connection,
     agent: &str,
@@ -1613,6 +1634,7 @@ fn part_seen(
     path: &Path,
     title: &str,
     opened_at: i64,
+    tz_offset: Option<i32>,
 ) -> Result<()> {
     let known: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM parts WHERE part_id = ?1)",
@@ -1660,9 +1682,17 @@ fn part_seen(
         }
     };
     conn.execute(
-        "INSERT INTO parts(part_id, archive_id, agent, path, opened_at, state)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'open')",
-        params![part_id, archive, agent, path.to_string_lossy(), opened_at],
+        "INSERT INTO parts(part_id, archive_id, agent, path, opened_at, state, tz_offset, title)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?7)",
+        params![
+            part_id,
+            archive,
+            agent,
+            path.to_string_lossy(),
+            opened_at,
+            tz_offset,
+            title,
+        ],
     )?;
     Ok(())
 }
@@ -1808,14 +1838,23 @@ pub fn ready(conn: &Connection, now: i64) -> Result<Vec<i64>> {
     stmt.query_map(params![ENDED, now], |r| r.get(0))?.collect()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchivePart {
+    pub path: String,
+    pub filename: String,
+    pub opened_at: i64,
+    pub tz_offset: Option<i32>,
+    pub title: String,
+}
+
 pub struct Archive {
     pub room: String,
     /// 开稿件时钉住的账号；房间当时不在库里则为空。
     pub account_id: Option<i64>,
     pub title: String,
     pub started_at: i64,
-    /// 已上传的分P：(agent 本地路径, UPOS 文件名)，按开录时刻排序。
-    pub parts: Vec<(String, String)>,
+    /// 已上传的分P，按开录时刻排序。
+    pub parts: Vec<ArchivePart>,
 }
 
 pub fn archive(conn: &Connection, id: i64) -> Result<Archive> {
@@ -1825,11 +1864,20 @@ pub fn archive(conn: &Connection, id: i64) -> Result<Archive> {
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
     )?;
     let mut stmt = conn.prepare(
-        "SELECT path, filename FROM parts WHERE archive_id = ?1 AND state = 'uploaded'
+        "SELECT path, filename, opened_at, tz_offset, title FROM parts
+         WHERE archive_id = ?1 AND state = 'uploaded'
          ORDER BY opened_at, part_id",
     )?;
     let parts = stmt
-        .query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .query_map([id], |r| {
+            Ok(ArchivePart {
+                path: r.get(0)?,
+                filename: r.get(1)?,
+                opened_at: r.get(2)?,
+                tz_offset: r.get(3)?,
+                title: r.get(4)?,
+            })
+        })?
         .collect::<Result<_>>()?;
     Ok(Archive {
         room,
@@ -2153,6 +2201,7 @@ pub mod tests {
                 part_id: part.into(),
                 path: format!("/rec/{part}.flv.part").into(),
                 title: "直播".into(),
+                tz_offset_secs: Some(8 * 3600),
             }),
             at,
         }
@@ -2478,7 +2527,16 @@ pub mod tests {
         .unwrap();
         assert_eq!(ready(&conn, i64::MAX).unwrap(), [1]);
         let a = archive(&conn, 1).unwrap();
-        assert_eq!(a.parts, [("/rec/p1.flv".to_string(), "n-p1".to_string())]);
+        assert_eq!(
+            a.parts,
+            [ArchivePart {
+                path: "/rec/p1.flv".into(),
+                filename: "n-p1".into(),
+                opened_at: 100,
+                tz_offset: Some(8 * 3600),
+                title: "直播".into(),
+            }]
+        );
         // 已上传的不会被晚到的 Lost 覆盖。
         apply(
             &conn,
@@ -2526,5 +2584,74 @@ pub mod tests {
             .query_row("SELECT phase FROM archives WHERE id = 1", [], |r| r.get(0))
             .unwrap();
         assert_eq!(phase, ATTENTION);
+    }
+
+    #[test]
+    fn migration_21_adds_tz_offset_and_title_and_archive_reads_them() {
+        // 从 v20 迁移到最新：旧分P行 tz_offset 为 NULL、title 为空串。
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute_batch(MIGRATION_1).unwrap();
+        for sql in &LATER[..19] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 20i64).unwrap();
+        conn.execute(
+            "INSERT INTO archives(id, room, session, title, started_at, phase)
+             VALUES (1, 'r', 's', '旧场', 1000, 'ended')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO parts(part_id, archive_id, agent, path, opened_at, state, filename)
+             VALUES ('old1', 1, 'a', '/rec/old1.flv', 1000, 'uploaded', 'f-old1')",
+            [],
+        )
+        .unwrap();
+
+        init(&mut conn, &[], || Ok(Import::default())).unwrap();
+        let ver: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(ver, VERSION);
+        let a = archive(&conn, 1).unwrap();
+        assert_eq!(
+            a.parts,
+            [ArchivePart {
+                path: "/rec/old1.flv".into(),
+                filename: "f-old1".into(),
+                opened_at: 1000,
+                tz_offset: None,
+                title: String::new(),
+            }]
+        );
+
+        // 新分P通过 PartOpened 记入 tz_offset_secs 与 title。
+        let conn2 = mem();
+        let ev_open = AgentEvent::Recorder {
+            event: Event::PartOpened(PartOpened {
+                owner: owner("s2"),
+                part_id: "p-tz".into(),
+                path: "/rec/p-tz.flv.part".into(),
+                title: "下半场标题".into(),
+                tz_offset_secs: Some(9 * 3600),
+            }),
+            at: 2000,
+        };
+        apply(&conn2, "a", &ev_open).unwrap();
+        apply(&conn2, "a", &closed("p-tz", "s2", 2100)).unwrap();
+        apply(&conn2, "a", &uploaded("p-tz")).unwrap();
+        let a2 = archive(&conn2, 1).unwrap();
+        assert_eq!(
+            a2.parts,
+            [ArchivePart {
+                path: "/rec/p-tz.flv".into(),
+                filename: "n-p-tz".into(),
+                opened_at: 2000,
+                tz_offset: Some(9 * 3600),
+                title: "下半场标题".into(),
+            }]
+        );
     }
 }

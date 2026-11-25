@@ -2,7 +2,7 @@ use crate::downloader::flv_parser::{
     AACPacketType, AVCPacketType, CodecId, FrameType, SoundFormat, TagData, TagHeader, TagType,
     aac_audio_packet_header, avc_video_packet_header, script_data, tag_data, tag_header,
 };
-use crate::downloader::flv_writer::{FlvFile, FlvTag, TagDataHeader};
+use crate::downloader::flv_writer::FlvFile;
 use crate::downloader::util::{EVENT_TARGET, LifecycleFile, Pace, SegmentCloseReason, Segmentable};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use nom::{Err, IResult};
@@ -28,8 +28,18 @@ pub(crate) async fn download_with_progress(
     segment: Segmentable,
     progress: &mut FlvProgress,
 ) -> crate::downloader::error::Result<()> {
+    download_with_progress_and_upgrade(connection, file, segment, progress, None).await
+}
+
+pub(crate) async fn download_with_progress_and_upgrade(
+    connection: &mut Connection,
+    file: LifecycleFile<'_>,
+    segment: Segmentable,
+    progress: &mut FlvProgress,
+    upgrade_signal: Option<&QualityUpgradeSignal>,
+) -> crate::downloader::error::Result<()> {
     let owner = file.owner().clone();
-    let result = parse_flv(connection, file, segment, progress).await;
+    let result = parse_flv_with_upgrade(connection, file, segment, progress, upgrade_signal).await;
     emit_disconnected(
         &owner,
         &connection.diagnostics(),
@@ -37,6 +47,57 @@ pub(crate) async fn download_with_progress(
         result.as_ref().err(),
     );
     result
+}
+
+/// 计划升档时的待上报信息：新流写入可用视频后才发布画质并记日志。
+#[derive(Debug, Clone)]
+pub(crate) struct PendingQualityUpgrade {
+    pub from_quality: String,
+    pub to_quality: String,
+    pub pace_quality: Option<String>,
+}
+
+/// 可撤销的计划升档收尾信号：由候选探测就绪后发出，旧 FLV 在下一个关键帧边界确认收尾。
+#[derive(Debug, Default)]
+pub(crate) struct QualityUpgradeSignal {
+    state: std::sync::atomic::AtomicU8,
+}
+
+impl QualityUpgradeSignal {
+    const IDLE: u8 = 0;
+    const REQUESTED: u8 = 1;
+    const ACKNOWLEDGED: u8 = 2;
+
+    pub fn request(&self) {
+        self.state
+            .store(Self::REQUESTED, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn cancel(&self) -> bool {
+        self.state
+            .compare_exchange(
+                Self::REQUESTED,
+                Self::IDLE,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    pub fn try_acknowledge(&self) -> bool {
+        self.state
+            .compare_exchange(
+                Self::REQUESTED,
+                Self::ACKNOWLEDGED,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    pub fn acknowledged(&self) -> bool {
+        self.state.load(std::sync::atomic::Ordering::Acquire) == Self::ACKNOWLEDGED
+    }
 }
 
 /// 一条连接内的分段与媒体时间戳进度。
@@ -72,6 +133,10 @@ pub struct FlvProgress {
     /// 无法精确计量（例如磁盘写失败）时为 None。
     pub discarded_tail_tags: Option<u64>,
     pub discarded_tail_bytes: Option<u64>,
+    /// 计划升档主动切换：照常写接缝日志，但不计入接缝健康检测。
+    pub(crate) skip_gap_health: bool,
+    /// 计划升档新连接待发布的画质变更。
+    pub(crate) pending_quality_upgrade: Option<PendingQualityUpgrade>,
 }
 
 impl FlvProgress {
@@ -90,8 +155,11 @@ impl FlvProgress {
         let (gap_ms, overlap_ms) = bounds.map_or((-1, -1), |(previous, first)| {
             ((first - previous).max(0), (previous - first).max(0))
         });
-        // 只有可靠推流时刻测得的接缝计入健康检测；跨过下播宽限的是源站本来就没内容，不算。
-        if let Some(pace) = pace.filter(|_| bounds.is_some() && !self.crossed_grace) {
+        // 只有可靠推流时刻测得的接缝计入健康检测；跨过下播宽限的是源站本来就没内容，不算；
+        // 计划升档主动切换本身也不计入接缝健康检测。
+        if let Some(pace) =
+            pace.filter(|_| bounds.is_some() && !self.crossed_grace && !self.skip_gap_health)
+        {
             pace.reconnect_gap(gap_ms as u64);
         }
         let reason_code = if bounds.is_some() {
@@ -660,11 +728,26 @@ impl FlvWriteState {
                     out.file.owner(),
                     segment.pace(),
                 );
-                if self.video_frames >= 2
-                    && let Some(pace) = segment.pace()
-                {
-                    pace.record_ready();
-                    pace.video_written();
+                if self.video_frames >= 2 {
+                    if let Some(pace) = segment.pace() {
+                        pace.record_ready();
+                        pace.video_written();
+                    }
+                    if let Some(upgrade) = progress.pending_quality_upgrade.take() {
+                        if let Some(pace) = segment.pace() {
+                            pace.set_quality(upgrade.pace_quality);
+                        }
+                        let owner = out.file.owner();
+                        info!(
+                            target: EVENT_TARGET,
+                            event_name = "recording.quality_upgraded",
+                            room = owner.room.as_str(),
+                            session = owner.session.as_str(),
+                            from_quality = upgrade.from_quality.as_str(),
+                            to_quality = upgrade.to_quality.as_str(),
+                            "直播画质已升档"
+                        );
+                    }
                 }
             }
             self.file_is_empty = false;
@@ -683,11 +766,181 @@ impl FlvWriteState {
     }
 }
 
+pub(crate) const CANDIDATE_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+pub(crate) const CANDIDATE_MAX_PREFIX_BYTES: usize = 8 * 1024 * 1024;
+
+struct ParsedFlvTag {
+    tag_header_bytes: Bytes,
+    tag_header: TagHeader,
+    bytes: Bytes,
+    previous_tag_size: Bytes,
+    is_video_keyframe: bool,
+    is_decodable_video: bool,
+    aac_sequence_header: bool,
+    h264_sequence_header: bool,
+    script_tag: bool,
+}
+
+async fn read_parsed_tag(
+    connection: &mut Connection,
+    remaining_prefix: Option<usize>,
+) -> crate::downloader::error::Result<Option<ParsedFlvTag>> {
+    let tag_header_bytes = connection.read_frame(11).await?;
+    if tag_header_bytes.is_empty() {
+        return Ok(None);
+    }
+
+    let (_, tag_header) = map_parse_err(tag_header(&tag_header_bytes), "tag header")?;
+
+    if remaining_prefix.is_some_and(|remaining| remaining < 11 + tag_header.data_size as usize + 4)
+    {
+        return Err(crate::downloader::error::Error::Custom(
+            "candidate FLV prefix exceeded 8 MiB before keyframe".to_string(),
+        ));
+    }
+    let bytes = connection.read_frame(tag_header.data_size as usize).await?;
+    let previous_tag_size = connection.read_frame(4).await?;
+    if bytes.len() != tag_header.data_size as usize || previous_tag_size.len() != 4 {
+        return Err(crate::downloader::error::Error::HttpFlvIncompleteFrame {
+            buffered: bytes.len() + previous_tag_size.len(),
+        });
+    }
+    let (i, flv_tag_data) = map_parse_err(
+        tag_data(tag_header.tag_type, tag_header.data_size as usize)(&bytes),
+        "tag data",
+    )?;
+    let mut aac_sequence_header = false;
+    let mut h264_sequence_header = false;
+    let mut script_tag = false;
+    let mut is_video_keyframe = false;
+    let mut is_decodable_video = false;
+    match flv_tag_data {
+        TagData::Audio(audio_data) => {
+            if audio_data.sound_format == SoundFormat::AAC {
+                let (_, packet_header) = map_parse_err(
+                    aac_audio_packet_header(audio_data.sound_data),
+                    "aac packet header",
+                )?;
+                aac_sequence_header = packet_header.packet_type == AACPacketType::SequenceHeader;
+            }
+        }
+        TagData::Video(video_data) => {
+            let packet_type = if CodecId::H264 == video_data.codec_id {
+                let (_, avc_video_header) = map_parse_err(
+                    avc_video_packet_header(video_data.video_data),
+                    "avc packet header",
+                )?;
+                h264_sequence_header =
+                    avc_video_header.packet_type == AVCPacketType::SequenceHeader;
+                Some(avc_video_header.packet_type)
+            } else {
+                None
+            };
+            is_video_keyframe = video_data.frame_type == FrameType::Key;
+            is_decodable_video = matches!(packet_type, Some(AVCPacketType::NALU) | None);
+        }
+        TagData::Script => {
+            let _ = map_parse_err(script_data(i), "script tag")?;
+            script_tag = true;
+        }
+    }
+    Ok(Some(ParsedFlvTag {
+        tag_header_bytes,
+        tag_header,
+        bytes,
+        previous_tag_size,
+        is_video_keyframe,
+        is_decodable_video,
+        aac_sequence_header,
+        h264_sequence_header,
+        script_tag,
+    }))
+}
+
+fn is_decodable_video_keyframe(tag: &ParsedFlvTag) -> bool {
+    !tag.bytes.is_empty()
+        && !is_sequence_header(tag.tag_header.tag_type, &tag.bytes)
+        && tag.is_video_keyframe
+        && tag.is_decodable_video
+}
+
+/// 候选流预探测：开单条 HTTP 连接、校验 FLV 头、预读至首个可解码视频关键帧，
+/// 不写盘也不触发 Pace 或事件，交付原 `Connection`（9 字节 FLV 头之后可重放前缀 + 未读缓冲）。
+pub(crate) async fn probe_candidate(
+    client: &crate::client::StatelessClient,
+    url: &str,
+    stall_timeout: Duration,
+) -> crate::downloader::error::Result<Connection> {
+    timeout(CANDIDATE_PROBE_TIMEOUT, async {
+        let response = client
+            .client
+            .get(url)
+            .headers(client.headers.clone())
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map_err(|e| crate::downloader::error::Error::Custom(e.without_url().to_string()))?;
+        let mut connection = Connection::with_stall_timeout(response, stall_timeout);
+        let head = connection.read_frame(9).await?;
+        if crate::downloader::flv_parser::header(&head).is_err() {
+            return Err(crate::downloader::error::Error::Custom(
+                "candidate response is not FLV".to_string(),
+            ));
+        }
+        let previous_tag_size_0 = connection.read_frame(4).await?;
+        if previous_tag_size_0.len() != 4 {
+            return Err(crate::downloader::error::Error::HttpFlvIncompleteFrame {
+                buffered: previous_tag_size_0.len(),
+            });
+        }
+        let mut prefix = BytesMut::with_capacity(4096);
+        prefix.extend_from_slice(&previous_tag_size_0);
+        let mut has_avc_config = false;
+        loop {
+            let remaining = CANDIDATE_MAX_PREFIX_BYTES - prefix.len();
+            let Some(parsed) = read_parsed_tag(&mut connection, Some(remaining)).await? else {
+                return Err(crate::downloader::error::Error::Custom(
+                    "candidate FLV ended before decodable video keyframe".to_string(),
+                ));
+            };
+            prefix.extend_from_slice(&parsed.tag_header_bytes);
+            prefix.extend_from_slice(&parsed.bytes);
+            prefix.extend_from_slice(&parsed.previous_tag_size);
+            if parsed.h264_sequence_header {
+                has_avc_config = parsed.bytes.len() > 5;
+            }
+            let has_video_payload = match parsed.bytes.first().map(|header| header & 0x0f) {
+                Some(7) => has_avc_config && parsed.bytes.len() > 5,
+                _ => parsed.bytes.len() > 1,
+            };
+            if is_decodable_video_keyframe(&parsed) && has_video_payload {
+                connection.prepend_replay(&prefix);
+                return Ok(connection);
+            }
+        }
+    })
+    .await
+    .map_err(|_| {
+        crate::downloader::error::Error::Custom("candidate FLV probe timed out".to_string())
+    })?
+}
+
+#[cfg(test)]
 pub(crate) async fn parse_flv(
+    connection: &mut Connection,
+    file: LifecycleFile<'_>,
+    segment: Segmentable,
+    progress: &mut FlvProgress,
+) -> crate::downloader::error::Result<()> {
+    parse_flv_with_upgrade(connection, file, segment, progress, None).await
+}
+
+pub(crate) async fn parse_flv_with_upgrade(
     connection: &mut Connection,
     file: LifecycleFile<'_>,
     mut segment: Segmentable,
     progress: &mut FlvProgress,
+    upgrade_signal: Option<&QualityUpgradeSignal>,
 ) -> crate::downloader::error::Result<()> {
     let mut flv_tags_cache: Vec<(TagHeader, Bytes, Bytes)> = Vec::new();
     let mut state = FlvWriteState {
@@ -714,107 +967,41 @@ pub(crate) async fn parse_flv(
     let mut start_anchored = false;
     let mut create_new = false;
     loop {
-        let tag_header_bytes = connection.read_frame(11).await?;
-        if tag_header_bytes.is_empty() {
+        let Some(parsed) = read_parsed_tag(connection, None).await? else {
             break;
-        }
-
-        let (_, tag_header) = map_parse_err(tag_header(&tag_header_bytes), "tag header")?;
-
-        let bytes = connection.read_frame(tag_header.data_size as usize).await?;
-        let previous_tag_size = connection.read_frame(4).await?;
-        if bytes.len() != tag_header.data_size as usize || previous_tag_size.len() != 4 {
-            return Err(crate::downloader::error::Error::HttpFlvIncompleteFrame {
-                buffered: bytes.len() + previous_tag_size.len(),
-            });
-        }
-        let (i, flv_tag_data) = map_parse_err(
-            tag_data(tag_header.tag_type, tag_header.data_size as usize)(&bytes),
-            "tag data",
-        )?;
-        let flv_tag = match flv_tag_data {
-            TagData::Audio(audio_data) => {
-                let packet_type = if audio_data.sound_format == SoundFormat::AAC {
-                    let (_, packet_header) = map_parse_err(
-                        aac_audio_packet_header(audio_data.sound_data),
-                        "aac packet header",
-                    )?;
-                    if packet_header.packet_type == AACPacketType::SequenceHeader {
-                        if aac_sequence_header.is_some() {
-                            warn!("Unexpected aac sequence header tag. {tag_header:?}");
-                        }
-                        aac_sequence_header =
-                            Some((tag_header, bytes.clone(), previous_tag_size.clone()))
-                    }
-                    Some(packet_header.packet_type)
-                } else {
-                    None
-                };
-
-                FlvTag {
-                    header: tag_header,
-                    data: TagDataHeader::Audio {
-                        sound_format: audio_data.sound_format,
-                        sound_rate: audio_data.sound_rate,
-                        sound_size: audio_data.sound_size,
-                        sound_type: audio_data.sound_type,
-                        packet_type,
-                    },
-                }
-            }
-            TagData::Video(video_data) => {
-                let (packet_type, composition_time) = if CodecId::H264 == video_data.codec_id {
-                    let (_, avc_video_header) = map_parse_err(
-                        avc_video_packet_header(video_data.video_data),
-                        "avc packet header",
-                    )?;
-                    if avc_video_header.packet_type == AVCPacketType::SequenceHeader {
-                        if let Some((_, binary_data, _)) = &h264_sequence_header {
-                            warn!("Unexpected h264 sequence header tag. {tag_header:?}");
-                            if bytes != binary_data {
-                                create_new = true;
-                                warn!("Different h264 sequence header tag. {tag_header:?}");
-                            }
-                        }
-                        h264_sequence_header =
-                            Some((tag_header, bytes.clone(), previous_tag_size.clone()))
-                    }
-                    (
-                        Some(avc_video_header.packet_type),
-                        Some(avc_video_header.composition_time),
-                    )
-                } else {
-                    (None, None)
-                };
-
-                FlvTag {
-                    header: tag_header,
-                    data: TagDataHeader::Video {
-                        frame_type: video_data.frame_type,
-                        codec_id: video_data.codec_id,
-                        packet_type,
-                        composition_time,
-                    },
-                }
-            }
-            TagData::Script => {
-                let (_, tag_data) = map_parse_err(script_data(i), "script tag")?;
-                if on_meta_data.is_some() {
-                    warn!("Unexpected script tag. {tag_header:?}");
-                }
-                on_meta_data = Some((tag_header, bytes.clone(), previous_tag_size.clone()));
-
-                FlvTag {
-                    header: tag_header,
-                    data: TagDataHeader::Script(tag_data),
-                }
-            }
         };
-        if let TagDataHeader::Video {
-            frame_type, packet_type: Some(AVCPacketType::NALU) | None, ..
-        } = &flv_tag.data
+        let decodable_video_keyframe = is_decodable_video_keyframe(&parsed);
+        let is_video_keyframe = parsed.is_video_keyframe;
+        let is_decodable_video = parsed.is_decodable_video;
+        let tag_header = parsed.tag_header;
+        let bytes = parsed.bytes;
+        let previous_tag_size = parsed.previous_tag_size;
+        if parsed.aac_sequence_header {
+            if aac_sequence_header.is_some() {
+                warn!("Unexpected aac sequence header tag. {tag_header:?}");
+            }
+            aac_sequence_header = Some((tag_header, bytes.clone(), previous_tag_size.clone()));
+        }
+        if parsed.h264_sequence_header {
+            if let Some((_, binary_data, _)) = &h264_sequence_header {
+                warn!("Unexpected h264 sequence header tag. {tag_header:?}");
+                if bytes != binary_data {
+                    create_new = true;
+                    warn!("Different h264 sequence header tag. {tag_header:?}");
+                }
+            }
+            h264_sequence_header = Some((tag_header, bytes.clone(), previous_tag_size.clone()));
+        }
+        if parsed.script_tag {
+            if on_meta_data.is_some() {
+                warn!("Unexpected script tag. {tag_header:?}");
+            }
+            on_meta_data = Some((tag_header, bytes.clone(), previous_tag_size.clone()));
+        }
+        if tag_header.tag_type == TagType::Video
+            && is_decodable_video
             && !is_sequence_header(tag_header.tag_type, &bytes)
-            && (has_keyframe || *frame_type == FrameType::Key)
+            && (has_keyframe || is_video_keyframe)
         {
             connection.video_watch.as_mut().unwrap().progress(tag_header.timestamp);
         }
@@ -825,16 +1012,8 @@ pub(crate) async fn parse_flv(
         {
             live_offset = Some(ts - tag_header.timestamp as i64);
         }
-        match &flv_tag {
-            FlvTag {
-                data:
-                    TagDataHeader::Video {
-                        frame_type: FrameType::Key,
-                        ..
-                    },
-                ..
-            } => {
-                let timestamp = flv_tag.header.timestamp as u64;
+        if is_video_keyframe {
+                let timestamp = tag_header.timestamp as u64;
                 if !start_anchored {
                     start_anchored = true;
                     // 重连后 CDN 可能给延续的非零时间基准，首个关键帧必须成为起点，
@@ -878,6 +1057,13 @@ pub(crate) async fn parse_flv(
                     );
                     out.file.set_close_reason(SegmentCloseReason::Cancelled);
                     pace.mark_cut_done();
+                    break;
+                }
+                // 计划升档收尾：用户停录与换机切点优先，之后才在真正视频关键帧边界响应升档信号。
+                if decodable_video_keyframe
+                    && segment.pace().and_then(Pace::cut_live).is_none()
+                    && upgrade_signal.is_some_and(QualityUpgradeSignal::try_acknowledge)
+                {
                     break;
                 }
 
@@ -932,15 +1118,10 @@ pub(crate) async fn parse_flv(
                     progress.last_split_at = Some(Instant::now());
                     create_new = false;
                 }
-                has_keyframe |= !is_sequence_header(tag_header.tag_type, &bytes)
-                    && matches!(flv_tag.data, TagDataHeader::Video {
-                        packet_type: Some(AVCPacketType::NALU) | None, ..
-                    });
+                has_keyframe |= decodable_video_keyframe;
                 flv_tags_cache.push((tag_header, bytes.clone(), previous_tag_size.clone()));
-            }
-            _ => {
-                flv_tags_cache.push((tag_header, bytes.clone(), previous_tag_size.clone()));
-            }
+        } else {
+            flv_tags_cache.push((tag_header, bytes.clone(), previous_tag_size.clone()));
         }
     }
     Ok(())
@@ -999,8 +1180,13 @@ pub(crate) async fn parse_flv(
         ))),
     };
     dts_rollup.flush(&out.file);
+    let upgrade_acked = upgrade_signal.is_some_and(QualityUpgradeSignal::acknowledged);
     let close_reason = if result.is_ok() {
-        out.file.fallback_reason(SegmentCloseReason::StreamEnded)
+        if upgrade_acked {
+            SegmentCloseReason::Unknown
+        } else {
+            out.file.fallback_reason(SegmentCloseReason::StreamEnded)
+        }
     } else {
         SegmentCloseReason::TransportError
     };
@@ -1190,6 +1376,20 @@ impl Connection {
         self
     }
 
+    pub(crate) fn set_pace(&mut self, pace: Option<std::sync::Arc<crate::downloader::util::Pace>>) {
+        self.pace = pace;
+    }
+
+    pub(crate) fn prepend_replay(&mut self, prefix: &[u8]) {
+        if prefix.is_empty() {
+            return;
+        }
+        let mut combined = BytesMut::with_capacity(prefix.len() + self.buffer.len());
+        combined.extend_from_slice(prefix);
+        combined.extend_from_slice(&self.buffer);
+        self.buffer = combined;
+    }
+
     pub fn diagnostics(&self) -> ConnectionDiagnostics {
         // 两个时长取同一个「现在」，否则数据刚连上就到时，静默时长可能比连接时长还长。
         let now = Instant::now();
@@ -1277,17 +1477,38 @@ mod tests {
     use crate::downloader::util::LifecycleFile;
     use bytes::{Buf, BufMut, Bytes, BytesMut};
     use futures::StreamExt;
+    use std::cell::RefCell;
     use std::collections::BTreeMap;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, Once};
     use std::time::Duration;
     use tracing::field::{Field, Visit};
     use tracing_subscriber::Layer;
     use tracing_subscriber::layer::SubscriberExt;
 
-    // 用 set_default 装上后要紧跟 rebuild_interest_cache：callsite 的 interest 是全局缓存，并行的测试
-    // 可能在本线程订阅者登记前就把它算成不发，事件就收不到了。
-    #[derive(Clone, Default)]
-    struct Captured(Arc<Mutex<Vec<BTreeMap<String, String>>>>);
+    type EventFields = BTreeMap<String, String>;
+
+    thread_local! {
+        static CAPTURE: RefCell<Option<Vec<EventFields>>> = const { RefCell::new(None) };
+    }
+
+    struct Captured;
+
+    impl Captured {
+        fn start() -> Self {
+            // 全局订阅者避免别的线程首次打日志时把该日志点缓存为禁用。
+            static INSTALL: Once = Once::new();
+            INSTALL.call_once(|| {
+                tracing::subscriber::set_global_default(tracing_subscriber::registry().with(Self))
+                    .unwrap();
+            });
+            CAPTURE.set(Some(Vec::new()));
+            Self
+        }
+
+        fn finish(self) -> Vec<EventFields> {
+            CAPTURE.take().unwrap()
+        }
+    }
 
     struct Collector<'a>(&'a mut BTreeMap<String, String>);
     impl Visit for Collector<'_> {
@@ -1312,10 +1533,29 @@ mod tests {
             if event.metadata().target() != super::EVENT_TARGET {
                 return;
             }
-            let mut fields = BTreeMap::new();
-            event.record(&mut Collector(&mut fields));
-            self.0.lock().unwrap().push(fields);
+            CAPTURE.with_borrow_mut(|capture| {
+                if let Some(events) = capture {
+                    let mut fields = BTreeMap::new();
+                    event.record(&mut Collector(&mut fields));
+                    events.push(fields);
+                }
+            });
         }
+    }
+
+    #[test]
+    fn captures_event_when_another_thread_hits_the_callsite_first() {
+        fn emit() {
+            tracing::warn!(target: super::EVENT_TARGET, event_name = "capture.probe");
+        }
+
+        let captured = Captured::start();
+        std::thread::spawn(emit).join().unwrap();
+        emit();
+
+        let events = captured.finish();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event_name"], "capture.probe");
     }
 
     fn append_tag(bytes: &mut Vec<u8>, tag_type: u8, body: &[u8], timestamp: u32) {
@@ -1570,11 +1810,7 @@ mod tests {
         for reset in [false, true] {
             let directory = tempfile::tempdir().unwrap();
             let template = directory.path().join("logged").display().to_string();
-            let captured = Captured::default();
-            let _guard = tracing::subscriber::set_default(
-                tracing_subscriber::registry().with(captured.clone()),
-            );
-            tracing::callsite::rebuild_interest_cache();
+            let captured = Captured::start();
             let bytes = splittable_flv(2, 32);
             let response = if reset {
                 let chunks = futures::stream::iter([
@@ -1590,7 +1826,7 @@ mod tests {
             let file = crate::downloader::util::LifecycleFile::new(&template, "flv");
             let result = super::download(&mut connection, file, Default::default()).await;
             assert_eq!(result.is_err(), reset);
-            let events = captured.0.lock().unwrap();
+            let events = captured.finish();
             let event = events
                 .iter()
                 .find(|e| e.get("event_name").map(String::as_str) == Some("recording.disconnected"))
@@ -1623,11 +1859,7 @@ mod tests {
         ] {
             let directory = tempfile::tempdir().unwrap();
             let template = directory.path().join("gap").display().to_string();
-            let captured = Captured::default();
-            let _guard = tracing::subscriber::set_default(
-                tracing_subscriber::registry().with(captured.clone()),
-            );
-            tracing::callsite::rebuild_interest_cache();
+            let captured = Captured::start();
             let mut bytes = splittable_flv(0, 0);
             for index in 0..3u32 {
                 let mut frame = vec![0x17, 1, 0, 0, 0];
@@ -1665,7 +1897,7 @@ mod tests {
             let counted: Vec<_> = pace.recent_gaps(0).into_iter().map(|(_, ms)| ms).collect();
             let expected: Vec<u64> = expected_gap.parse().into_iter().collect();
             assert_eq!(counted, expected, "gap={expected_gap}");
-            let events = captured.0.lock().unwrap();
+            let events = captured.finish();
             let gaps: Vec<_> = events
                 .iter()
                 .filter(|e| {
@@ -1684,10 +1916,7 @@ mod tests {
     async fn a_size_split_closes_the_segment_with_split_limit() {
         let directory = tempfile::tempdir().unwrap();
         let template = directory.path().join("split").display().to_string();
-        let captured = Captured::default();
-        let _guard =
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(captured.clone()));
-        tracing::callsite::rebuild_interest_cache();
+        let captured = Captured::start();
 
         let mut connection = Connection::new(complete_response(splittable_flv(6, 2_000)));
         // The caller consumes the 9 byte FLV header before handing the stream to the parser.
@@ -1699,7 +1928,7 @@ mod tests {
             .await
             .unwrap();
 
-        let events = captured.0.lock().unwrap().clone();
+        let events = captured.finish();
         let closes: Vec<_> = events
             .iter()
             .filter(|fields| {
@@ -1820,10 +2049,7 @@ mod tests {
     #[tokio::test]
     async fn cut_live_closes_before_the_matching_keyframe_and_ignores_streams_without_sei() {
         const LIVE0: i64 = 1_792_908_000_000;
-        let captured = Captured::default();
-        let _guard =
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(captured.clone()));
-        tracing::callsite::rebuild_interest_cache();
+        let captured = Captured::start();
         let mut bytes = vec![b'F', b'L', b'V', 1, 5, 0, 0, 0, 9, 0, 0, 0, 0];
         append_tag(&mut bytes, 9, &[0x17, 0x00, 0, 0, 0, 0x01, 0x64, 0x00], 0);
         for index in 0..5u32 {
@@ -1879,7 +2105,7 @@ mod tests {
         assert_eq!(media_ts, [50_000, 50_500, 51_000, 51_500]);
         assert!(!media_ts.contains(&52_000));
         {
-            let events = captured.0.lock().unwrap();
+            let events = captured.finish();
             let gap = events
                 .iter()
                 .find(|e| e.get("event_name").map(String::as_str) == Some("recording.handoff_gap"))
@@ -2104,10 +2330,7 @@ mod tests {
     async fn a_zero_timestamp_keyframe_does_not_shatter_the_segment() {
         let directory = tempfile::tempdir().unwrap();
         let template = directory.path().join("rebase").display().to_string();
-        let captured = Captured::default();
-        let _guard =
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(captured.clone()));
-        tracing::callsite::rebuild_interest_cache();
+        let captured = Captured::start();
 
         let mut connection = Connection::new(complete_response(
             flv_with_absolute_base_and_zero_keyframes(10, 4_000),
@@ -2128,7 +2351,7 @@ mod tests {
         );
         assert!(progress.splits >= 2, "配置的 3s 定时分段仍必须生效");
 
-        let events = captured.0.lock().unwrap().clone();
+        let events = captured.finish();
         let shards: Vec<_> = events
             .iter()
             .filter(|fields| {
@@ -2152,9 +2375,8 @@ mod tests {
     fn dts_rollup_reports_the_first_jump_then_one_summary_per_segment() {
         let directory = tempfile::tempdir().unwrap();
         let template = directory.path().join("dts-%Y%m%d").display().to_string();
-        let captured = Captured::default();
-        let subscriber = tracing_subscriber::registry().with(captured.clone());
-        let (first_id, second_id) = tracing::subscriber::with_default(subscriber, || {
+        let captured = Captured::start();
+        let (first_id, second_id) = {
             let mut file = LifecycleFile::new(&template, "flv");
             let mut rollup = DtsBackwardRollup::default();
 
@@ -2170,9 +2392,9 @@ mod tests {
             rollup.record(&file, 2_000, 1_900, 2_010, "timestamp_backward");
             rollup.flush(&file);
             (first_id, second_id)
-        });
+        };
 
-        let events = captured.0.lock().unwrap().clone();
+        let events = captured.finish();
         let names: Vec<_> = events
             .iter()
             .filter(|fields| {
@@ -2564,10 +2786,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         // 同一秒内切段会撞同名文件，用纳秒占位符把两段分开
         let template = directory.path().join("rebased-%f").display().to_string();
-        let captured = Captured::default();
-        let _guard =
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(captured.clone()));
-        tracing::callsite::rebuild_interest_cache();
+        let captured = Captured::start();
 
         let mut connection = Connection::new(complete_response(flv_with_a_mid_stream_base_change(
             10, 4_000,
@@ -2612,7 +2831,7 @@ mod tests {
             }
         }
 
-        let events = captured.0.lock().unwrap().clone();
+        let events = captured.finish();
         assert!(
             events.iter().any(|fields| {
                 fields.get("event_name").map(String::as_str) == Some("recording.dts_backward")
@@ -2794,6 +3013,164 @@ mod tests {
         );
         // 连接总时长与静默时长是两个口径，不能混用
         assert!(diagnostics.connected_for >= silent);
+    }
+
+    #[tokio::test]
+    async fn probe_candidate_replays_prefix_without_double_counting_bytes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let body = splittable_flv(2, 32);
+        let expected_len = body.len() as u64;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body_srv = body.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut req = [0u8; 1024];
+            let _ = socket.read(&mut req).await.unwrap();
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body_srv.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            socket.write_all(&body_srv).await.unwrap();
+        });
+
+        let client = crate::client::StatelessClient::new(reqwest::header::HeaderMap::new());
+        let mut conn = super::probe_candidate(
+            &client,
+            &format!("http://{addr}/live.flv"),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("probe should succeed on valid FLV");
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = LifecycleFile::new(dir.path().join("out").to_str().unwrap(), "flv");
+        let mut progress = super::FlvProgress::default();
+        super::parse_flv(&mut conn, file, Default::default(), &mut progress)
+            .await
+            .expect("replayed parse_flv should succeed");
+        server.await.unwrap();
+
+        assert_eq!(conn.diagnostics().received_bytes, expected_len);
+        assert_eq!(progress.video_frames, 2);
+        assert!(dir.path().join("out.flv").exists());
+    }
+
+    #[tokio::test]
+    async fn probe_candidate_rejects_bad_flv_audio_only_oversized_and_timeout() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn serve_once(body: Vec<u8>, stall: bool) -> String {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut req = [0u8; 1024];
+                let _ = socket.read(&mut req).await.unwrap();
+                let headers = if stall {
+                    "HTTP/1.1 200 OK\r\nContent-Type: video/x-flv\r\n\r\n".to_string()
+                } else {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                };
+                socket.write_all(headers.as_bytes()).await.unwrap();
+                let _ = socket.write_all(&body).await;
+                if stall {
+                    tokio::time::sleep(Duration::from_secs(20)).await;
+                }
+            });
+            format!("http://{addr}/live.flv")
+        }
+
+        let client = crate::client::StatelessClient::new(reqwest::header::HeaderMap::new());
+
+        // 1. 坏 FLV 头
+        let bad_url = serve_once(b"NOT_FLV_DATA".to_vec(), false).await;
+        assert!(
+            super::probe_candidate(&client, &bad_url, Duration::from_secs(5))
+                .await
+                .is_err()
+        );
+
+        // 2. 只有序列头和音频，无关键帧就 EOF
+        let mut audio_only = vec![b'F', b'L', b'V', 1, 5, 0, 0, 0, 9, 0, 0, 0, 0];
+        append_tag(&mut audio_only, 8, &[0xaf, 0x00, 0x12, 0x10], 0);
+        append_tag(
+            &mut audio_only,
+            9,
+            &[0x17, 0x00, 0, 0, 0, 0x01, 0x64, 0x00],
+            0,
+        );
+        append_tag(&mut audio_only, 8, &[0xaf, 0x01, 0x22, 0x33], 1000);
+        let audio_url = serve_once(audio_only, false).await;
+        assert!(
+            super::probe_candidate(&client, &audio_url, Duration::from_secs(5))
+                .await
+                .is_err()
+        );
+
+        let valid_url = serve_once(splittable_flv(2, 32), false).await;
+        assert!(
+            super::probe_candidate(&client, &valid_url, Duration::from_secs(5))
+                .await
+                .is_ok(),
+            "模拟 HTTP 服务须能提供可接受的 FLV"
+        );
+
+        for (sequence_header, keyframe) in [
+            (None, &[0x17, 1, 0, 0, 0, 0x65][..]),
+            (Some(&[0x17, 0, 0, 0, 0][..]), &[0x17, 1, 0, 0, 0, 0x65][..]),
+            (
+                Some(&[0x17, 0, 0, 0, 0, 1, 0x64, 0][..]),
+                &[0x17, 1, 0, 0, 0][..],
+            ),
+        ] {
+            let mut body = b"FLV\x01\x05\x00\x00\x00\x09\x00\x00\x00\x00".to_vec();
+            if let Some(sequence_header) = sequence_header {
+                append_tag(&mut body, 9, sequence_header, 0);
+            }
+            append_tag(&mut body, 9, keyframe, 1_000);
+            let url = serve_once(body, false).await;
+            assert!(
+                super::probe_candidate(&client, &url, Duration::from_secs(5))
+                    .await
+                    .is_err(),
+                "缺少有效 AVC 序列头或视频负载时不能切换"
+            );
+        }
+
+        // 3. 前缀超过 8 MiB 仍无关键帧
+        let mut oversized = vec![b'F', b'L', b'V', 1, 5, 0, 0, 0, 9, 0, 0, 0, 0];
+        let big_audio = vec![0xaf, 0x01, 0x11, 0x22];
+        let mut big_frame = vec![0xaf, 0x01];
+        big_frame.resize(4 * 1024 * 1024 + 100, 0x55);
+        append_tag(&mut oversized, 8, &big_audio, 0);
+        append_tag(&mut oversized, 8, &big_frame, 1000);
+        append_tag(&mut oversized, 8, &big_frame, 2000);
+        let oversized_url = serve_once(oversized, false).await;
+        assert!(
+            super::probe_candidate(&client, &oversized_url, Duration::from_secs(5))
+                .await
+                .is_err()
+        );
+
+        // 4. 超过 8 秒超时
+        let stall_url =
+            serve_once(vec![b'F', b'L', b'V', 1, 5, 0, 0, 0, 9, 0, 0, 0, 0], true).await;
+        assert!(
+            super::probe_candidate(&client, &stall_url, Duration::from_secs(30))
+                .await
+                .is_err()
+        );
     }
 
     #[test]
