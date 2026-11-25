@@ -28,12 +28,30 @@ const RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
 const RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
 /// 停止时等录制在下一个关键帧收尾的上限，超时直接丢弃（drop 兜底收尾，丢最后一个 GOP）。
 const STOP_GRACE: Duration = Duration::from_secs(10);
+/// 换节点观测（`edge_probe`）：短于这个的连接算短连接；同一场两次观测至少隔这么久。
+const EDGE_PROBE_SHORT: Duration = Duration::from_secs(30);
+const EDGE_PROBE_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 /// 抖音画质复查：前 5 分钟每 30 秒一次，之后每 120 秒一次；单次接口复查最多 10 秒，切段等待最多 5 秒。
 const QUALITY_RECHECK_FAST_INTERVAL: Duration = Duration::from_secs(30);
 const QUALITY_RECHECK_SLOW_INTERVAL: Duration = Duration::from_secs(120);
 const QUALITY_RECHECK_FAST_WINDOW: Duration = Duration::from_secs(5 * 60);
 const QUALITY_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 const QUALITY_HANDOVER_GRACE: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
+struct EdgeTrial {
+    previous_short: bool,
+    attempted: bool,
+}
+
+impl EdgeTrial {
+    fn after_connection(&mut self, short: bool) -> bool {
+        let attempt = short && self.previous_short && !self.attempted;
+        self.previous_short = short;
+        self.attempted |= attempt;
+        attempt
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct RecordConfig {
@@ -52,6 +70,8 @@ pub struct RecordConfig {
     pub offline_grace: Duration,
     /// 码流停顿看门狗阈值。
     pub stall_timeout: Duration,
+    /// 同一场连续短连后试验一次抖音 CDN 换节点。
+    pub douyin_edge_switch: bool,
     pub options: LiveOptions,
     pub credentials: LiveCredentials,
     /// 分段收尾、下播时往这里发事件（agent 用）；`None` 只写日志。
@@ -76,6 +96,7 @@ impl Default for RecordConfig {
             poll_interval: Duration::from_secs(30),
             offline_grace: Duration::from_secs(300),
             stall_timeout: httpflv::DEFAULT_STALL_TIMEOUT,
+            douyin_edge_switch: false,
             options: LiveOptions::default(),
             credentials: LiveCredentials::default(),
             events: None,
@@ -158,6 +179,9 @@ async fn record_session(
     let mut previous_live_ms = None;
     // 上一条有效连接之后复查过不在播：下一个接缝跨过了下播宽限，不计入健康检测。
     let mut crossed_grace = false;
+    let mut last_probe: Option<Instant> = None;
+    let mut edge_trial = EdgeTrial::default();
+    let mut edge_attempt = None;
     let session_started_at = tokio::time::Instant::now();
     let mut next_quality_recheck_at: Option<tokio::time::Instant> = None;
     let mut preopened: Option<Connection> = None;
@@ -187,6 +211,7 @@ async fn record_session(
             previous_live_ms,
             crossed_grace,
             skip_gap_health,
+            edge_attempt: edge_attempt.take(),
             pending_quality_upgrade: pending_quality_upgrade.take(),
             ..Default::default()
         };
@@ -218,6 +243,7 @@ async fn record_session(
             return None;
         }
         if let Some(candidate) = outcome.upgraded_to {
+            edge_trial.after_connection(false);
             if let Some(pace) = &config.pace {
                 // 清理旧连接的 connected_at，但不计入频繁短连接或故障重试。
                 let _ = pace.take_connected();
@@ -266,6 +292,57 @@ async fn record_session(
                     return Some(*next);
                 }
                 stream = *next;
+                if config.douyin_edge_switch
+                    && plugin.name() == "Douyin"
+                    && !stream.name.starts_with("probe:")
+                    && (config.staging.is_none()
+                        || config.pace.as_ref().is_some_and(|pace| pace.promoted()))
+                    && edge_trial.after_connection(
+                        !in_grace
+                            && progress.received_media
+                            && progress
+                                .connection_diagnostics
+                                .as_ref()
+                                .is_some_and(|connection| {
+                                    connection.connected_for < EDGE_PROBE_SHORT
+                                }),
+                    )
+                    && !matches!(
+                        media_ext_from_url(&stream.raw_stream_url).as_deref(),
+                        Some("m3u8" | "ts")
+                    )
+                {
+                    edge_attempt = Some(httpflv::EdgeAttempt {
+                        id: format!("{:016x}", rand::random::<u64>()),
+                        previous_edge: progress
+                            .connection_diagnostics
+                            .and_then(|connection| connection.edge)
+                            .map(|addr| addr.ip()),
+                        previous_ended: ended.0,
+                        first_video_wall_ms: None,
+                    });
+                }
+                let short = progress.received_media
+                    && connected
+                        .filter(|_| !in_grace)
+                        .is_some_and(|at| ended.0.saturating_duration_since(at) < EDGE_PROBE_SHORT);
+                let trigger = if progress.video_stalled {
+                    Some("video_stalled")
+                } else {
+                    short.then_some("short_connection")
+                };
+                if let Some(trigger) = trigger
+                    && last_probe.is_none_or(|t| t.elapsed() >= EDGE_PROBE_COOLDOWN)
+                {
+                    last_probe = Some(Instant::now());
+                    tokio::spawn(crate::edge_probe::probe(
+                        stream.name.clone(),
+                        session.clone(),
+                        trigger,
+                        stream.raw_stream_url.clone(),
+                        stream.stream_headers.clone(),
+                    ));
+                }
                 if let Some(pace) = &config.pace {
                     // 平台确认仍是同一场在播时结束的连接，才计入频繁短连接；切段不结束连接，
                     // 主动停止、交接收尾、换场、下播宽限都在这之前返回或另走分支。
@@ -294,6 +371,7 @@ async fn record_session(
                 }
             }
             status => {
+                edge_trial.after_connection(false);
                 // 平台不确认在播时按下播宽限处理，不把源站离线当成本机受限。
                 if let Some(pace) = &config.pace {
                     pace.record_recovered();
@@ -466,6 +544,58 @@ async fn probe_upgrade_candidate(
     })
 }
 
+async fn probe_edge_candidate(
+    url: &str,
+    headers: HeaderMap,
+    stall_timeout: Duration,
+    owner: &RecordingOwner,
+    attempt: &httpflv::EdgeAttempt,
+) -> Option<Connection> {
+    let started = Instant::now();
+    let address = crate::edge_probe::alternate_address(url).await;
+    let dns_ms = started.elapsed().as_millis() as u64;
+    let mut probe = httpflv::CandidateProbe {
+        stage: "dns",
+        ..Default::default()
+    };
+    let mut probe_ms = None;
+    let candidate = async {
+        let (host, addr) = address.as_ref()?;
+        probe.stage = "client";
+        let mut alternate = StatelessClient::with_resolution(headers, Some((host, *addr))).ok()?;
+        alternate
+            .headers
+            .append(ACCEPT_ENCODING, HeaderValue::from_static("gzip, deflate"));
+        let requested = Instant::now();
+        let result =
+            httpflv::probe_candidate_with_diagnostics(&alternate, url, stall_timeout, &mut probe)
+                .await;
+        probe_ms = Some(requested.elapsed().as_millis() as u64);
+        result.ok()
+    }
+    .await;
+    info!(
+        target: crate::downloader::util::EVENT_TARGET,
+        event_name = "recording.edge_switch",
+        outcome = if candidate.is_some() { "connected" } else { "fallback" },
+        edge_attempt_id = attempt.id.as_str(),
+        previous_edge = attempt.previous_edge.map(|ip| ip.to_string()).as_deref(),
+        resolver = crate::edge_probe::SWITCH_RESOLVER,
+        dns_ip = address.as_ref().map(|(_, addr)| addr.ip().to_string()).as_deref(),
+        candidate_edge = probe.edge.map(|ip| ip.to_string()).as_deref(),
+        http_status = probe.http_status,
+        failed_stage = candidate.is_none().then_some(probe.stage),
+        probe_budget_exhausted = probe.budget_exhausted,
+        dns_ms,
+        probe_ms,
+        keyframe_ms = probe_ms.filter(|_| candidate.is_some()),
+        room = owner.room.as_str(),
+        session = owner.session.as_str(),
+        "重连换节点试验"
+    );
+    candidate
+}
+
 /// 一次拉流尝试，返回是否拿到了真实媒体。已知 HLS 直接走 HLS；其余先试 FLV，
 /// 响应不是 FLV 头时回落 HLS。
 #[cfg(test)]
@@ -507,7 +637,7 @@ async fn record_once_with_upgrade<F: Fn() -> LiveRequest>(
             };
         }
     };
-    let mut client = StatelessClient::new(headers);
+    let mut client = StatelessClient::new(headers.clone());
     let owner = RecordingOwner {
         room: stream.name.clone(),
         session: session.to_string(),
@@ -568,9 +698,19 @@ async fn record_once_with_upgrade<F: Fn() -> LiveRequest>(
         }))
     };
     let url = stream.raw_stream_url.as_str();
+    let edge_attempt_id = progress
+        .edge_attempt
+        .as_ref()
+        .map(|attempt| attempt.id.clone());
 
     let download = async {
-        let mut connection = if let Some(mut conn) = preopened {
+        let switched = if let Some(attempt) = &progress.edge_attempt {
+            probe_edge_candidate(url, headers, config.stall_timeout, &owner, attempt).await
+        } else {
+            None
+        };
+        progress.edge_switched = switched.is_some();
+        let mut connection = if let Some(mut conn) = switched.or(preopened) {
             conn.set_pace(config.pace.clone());
             conn
         } else {
@@ -618,10 +758,14 @@ async fn record_once_with_upgrade<F: Fn() -> LiveRequest>(
         flv_started.store(true, Ordering::Release);
         flv_started_notify.notify_one();
         if let Some(pace) = pace {
-            pace.mark_connected();
+            if progress.edge_switched {
+                pace.mark_connected_at(connection.started_at());
+            } else {
+                pace.mark_connected();
+            }
         }
         let _wall = pace.map(Pace::running);
-        httpflv::download_with_progress_and_upgrade(
+        let result = httpflv::download_with_progress_and_upgrade(
             &mut connection,
             file("flv"),
             segment,
@@ -629,7 +773,9 @@ async fn record_once_with_upgrade<F: Fn() -> LiveRequest>(
             Some(&upgrade_signal),
         )
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string());
+        progress.connection_diagnostics = Some(connection.diagnostics());
+        result
     };
     tokio::pin!(download);
 
@@ -729,6 +875,7 @@ async fn record_once_with_upgrade<F: Fn() -> LiveRequest>(
     if let Err(e) = result {
         warn!(
             room = stream.name,
+            edge_attempt_id = edge_attempt_id.as_deref(),
             error = e,
             "download attempt ended with error"
         );
@@ -993,6 +1140,18 @@ impl OfflineRetryState {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn edge_trial_requires_consecutive_short_connections_and_runs_once() {
+        let mut trial = super::EdgeTrial::default();
+        for short in [true, false, true] {
+            assert!(!trial.after_connection(short));
+        }
+        assert!(trial.after_connection(true));
+        for short in [true, false, true, true] {
+            assert!(!trial.after_connection(short));
+        }
+    }
+
     use super::*;
     use chrono::TimeZone;
 

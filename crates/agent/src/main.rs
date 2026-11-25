@@ -66,6 +66,9 @@ struct Config {
     /// 那时忽略总控下发的文件名模板，启动时警告一次。
     #[serde(default = "default_output")]
     output: String,
+    /// 本机是否启用抖音短连后的 CDN 换节点试验。
+    #[serde(default)]
+    douyin_edge_switch: bool,
     /// 录 B 站用的 cookie 文件（拉高画质要登录）。最好是专录制的小号，不是投稿账号。
     record_cookies: Option<PathBuf>,
 }
@@ -115,6 +118,7 @@ impl Config {
             streamer: streamer.to_string(),
             split_time: room.split_time,
             split_size: room.split_size_mb.map(|mb| mb * 1024 * 1024),
+            douyin_edge_switch: self.douyin_edge_switch,
             events: Some(events),
             pace: Some(pace),
             tz_offset,
@@ -1037,7 +1041,28 @@ mod tests {
         assert_eq!(rc.split_time, Some(Duration::from_secs(120)));
         assert_eq!(rc.options.bilibili.qn, 10000);
         assert_eq!(rc.options.douyin.quality, "hd");
+        assert!(!rc.douyin_edge_switch);
         assert_eq!(rc.tz_offset, tz);
+    }
+
+    #[test]
+    fn douyin_edge_switch_can_be_enabled_per_agent() {
+        let c: Config = toml::from_str(
+            r#"
+            controller = "http://127.0.0.1:7070/"
+            token = "t"
+            state = "s.json"
+            douyin_edge_switch = true
+            "#,
+        )
+        .unwrap();
+        let rc = c.record_config(
+            &task("r", "u"),
+            unbounded_channel().0,
+            Default::default(),
+            None,
+        );
+        assert!(rc.douyin_edge_switch);
     }
 
     /// 试拉写进录制目录下的 `.probe/`、不发事件；任务名带前缀，不边录边传。
