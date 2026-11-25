@@ -120,6 +120,7 @@ impl BilibiliLive {
                 platform: "bilibili".to_string(),
                 stream_headers: self.stream_headers(),
                 recording_quality: Some(qn_name(selected_qn)),
+                recording_quality_code: None,
                 // B 站 room_id 跨场不变，场次需配合开播时刻区分。
                 live_session_key: Some(format!("{}-{}", profile.room_id, profile.live_start_time)),
             }),

@@ -1271,6 +1271,7 @@ mod tests {
             part_id: name.into(),
             path: part.clone(),
             title: "t".into(),
+            tz_offset_secs: None,
         });
         (ev, part)
     }

@@ -100,7 +100,8 @@ impl DouyinLive {
         let Some(room_info) = self.get_room_info().await? else {
             return Ok(LiveStatus::Offline);
         };
-        let (raw_stream_url, recording_quality) = self.select_stream_url(&room_info)?;
+        let (raw_stream_url, recording_quality_code, recording_quality) =
+            self.select_stream_url(&room_info)?;
         let title = room_info
             .get("title")
             .and_then(Value::as_str)
@@ -117,6 +118,7 @@ impl DouyinLive {
                 platform: "douyin".to_string(),
                 stream_headers: self.stream_headers(),
                 recording_quality: Some(recording_quality),
+                recording_quality_code: Some(recording_quality_code),
                 // `room.id_str` 标识这一场直播，跨进程重启不变，可用作场次键。
                 live_session_key: self.room_id.clone(),
             }),
@@ -355,8 +357,8 @@ impl DouyinLive {
         Ok(Some(room_info))
     }
 
-    /// 返回（流地址，实际画质在本房间的显示名）。
-    fn select_stream_url(&self, room_info: &Value) -> LiveResult<(String, String)> {
+    /// 返回（流地址，实际画质代码，实际画质在本房间的显示名）。
+    fn select_stream_url(&self, room_info: &Value) -> LiveResult<(String, String, String)> {
         let mut pull_data = room_info.pointer("/stream_url/live_core_sdk_data/pull_data");
         if self.double_screen
             && let Some(double_screen) = room_info
@@ -388,7 +390,7 @@ impl DouyinLive {
                 .filter(|url| !is_replay_url(url))
         {
             let url = normalize_stream_url(&url.replace("&only_audio=1", ""));
-            return Ok((url, quality_name(pull_data, "origin")));
+            return Ok((url, "origin".to_string(), quality_name(pull_data, "origin")));
         }
 
         let available: Vec<&str> = stream_data.keys().map(String::as_str).collect();
@@ -402,7 +404,11 @@ impl DouyinLive {
             .filter(|url| !is_replay_url(url))
             .map(normalize_stream_url)
             .ok_or_else(|| LiveError::custom("抖音可用直播流为空"))?;
-        Ok((url, quality_name(pull_data, selected_quality)))
+        Ok((
+            url,
+            selected_quality.to_string(),
+            quality_name(pull_data, selected_quality),
+        ))
     }
 
     fn stream_headers(&self) -> HashMap<String, String> {
@@ -414,7 +420,22 @@ impl DouyinLive {
     }
 }
 
-const QUALITY_CODES: [&str; 6] = ["origin", "uhd", "hd", "sd", "ld", "md"];
+pub(crate) const QUALITY_CODES: [&str; 6] = ["origin", "uhd", "hd", "sd", "ld", "md"];
+
+pub(crate) fn normalize_requested_quality(requested: &str) -> &'static str {
+    QUALITY_CODES
+        .iter()
+        .copied()
+        .find(|code| *code == requested)
+        .unwrap_or("origin")
+}
+
+pub(crate) fn quality_rank(code: &str) -> Option<usize> {
+    QUALITY_CODES
+        .iter()
+        .position(|c| *c == code)
+        .map(|idx| QUALITY_CODES.len() - idx)
+}
 
 /// 房间在直播：status=2，且没有结束时间。下播后跳转的回放房间仍回 status=2，
 /// 但已写入 finish_time（biliup #1663）。
@@ -548,11 +569,7 @@ fn quality_name(pull_data: Option<&Value>, code: &str) -> String {
 /// 在 available 列表中，按 origin>uhd>hd>sd>ld>md 的优先级为 requested 选一档可用画质：
 /// 命中则用之；否则先往更低档找，再往更高档找；都没有返回 None。
 fn select_quality_code(available: &[&str], requested: &str) -> Option<&'static str> {
-    let requested = if QUALITY_CODES.contains(&requested) {
-        requested
-    } else {
-        "origin"
-    };
+    let requested = normalize_requested_quality(requested);
     let idx = QUALITY_CODES
         .iter()
         .position(|i| *i == requested)
@@ -973,6 +990,72 @@ mod quality_tests {
     #[test]
     fn none_when_empty() {
         assert_eq!(select_quality_code(&[], "origin"), None);
+    }
+
+    #[test]
+    fn select_stream_url_returns_code_and_display_name_including_true_origin() {
+        use super::{DouyinLive, normalize_requested_quality, quality_rank};
+        use crate::downloader::live::{DouyinOptions, LiveCredentials, LiveOptions, LiveRequest};
+
+        assert_eq!(normalize_requested_quality("unknown"), "origin");
+        assert_eq!(normalize_requested_quality("hd"), "hd");
+        assert!(quality_rank("sd") < quality_rank("hd"));
+        assert!(quality_rank("hd") < quality_rank("origin"));
+        assert_eq!(quality_rank("unknown"), None);
+
+        let stream_data = json!({
+            "data": {
+                "sd": {"main": {"flv": "http://example.com/sd.flv"}},
+                "ao": {"main": {"flv": "http://example.com/ao.flv?a=1&only_audio=1"}}
+            }
+        });
+        let room_info = json!({
+            "stream_url": {
+                "live_core_sdk_data": {
+                    "pull_data": {
+                        "stream_data": stream_data.to_string(),
+                        "options": {
+                            "qualities": [
+                                {"sdk_key": "sd", "name": "高清"},
+                                {"sdk_key": "origin", "name": "原画"}
+                            ]
+                        }
+                    }
+                }
+            }
+        });
+
+        let make_live = |quality: &str, true_origin: bool| {
+            DouyinLive::new(LiveRequest {
+                client: reqwest::Client::new(),
+                url: "https://live.douyin.com/123".to_string(),
+                name: "room".to_string(),
+                options: LiveOptions {
+                    douyin: DouyinOptions {
+                        quality: quality.to_string(),
+                        protocol: "flv".to_string(),
+                        double_screen: false,
+                        true_origin,
+                    },
+                    ..Default::default()
+                },
+                credentials: LiveCredentials::default(),
+            })
+        };
+
+        let (url, code, name) = make_live("origin", true)
+            .select_stream_url(&room_info)
+            .unwrap();
+        assert_eq!(url, "https://example.com/ao.flv?a=1");
+        assert_eq!(code, "origin");
+        assert_eq!(name, "原画");
+
+        let (url, code, name) = make_live("origin", false)
+            .select_stream_url(&room_info)
+            .unwrap();
+        assert_eq!(url, "https://example.com/sd.flv");
+        assert_eq!(code, "sd");
+        assert_eq!(name, "高清");
     }
 }
 

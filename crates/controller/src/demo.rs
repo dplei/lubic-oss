@@ -44,6 +44,7 @@ fn part_event(
             part_id: part.into(),
             path: format!("/rec/{part}.flv.part").into(),
             title: title.into(),
+            tz_offset_secs: Some(8 * 3600),
         })
     };
     AgentEvent::Recorder { event, at }

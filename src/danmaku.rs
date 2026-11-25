@@ -638,6 +638,7 @@ mod tests {
             part_id: id.into(),
             path: dir.join(format!("{id}.flv.part")),
             title: String::new(),
+            tz_offset_secs: None,
         })
     }
 

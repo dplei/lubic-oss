@@ -235,8 +235,6 @@ impl App {
                         Some("offline")
                     } else if handing {
                         Some("handoff")
-                    } else if trouble.is_none() {
-                        Some("recovered")
                     } else {
                         None
                     }
@@ -287,6 +285,20 @@ impl App {
             match observe(samples, t.trouble.window_ms(), broken, now - t.since) {
                 Verdict::Waiting => {
                     self.trials.lock().unwrap().insert(name.to_string(), t);
+                }
+                Verdict::Healthy if trouble.is_none() => {
+                    // 原机信号中途回落不取消，观察完才看：此刻已恢复就不迁（断续故障会让信号反复回落）。
+                    info!(
+                        event_name = "health.trial",
+                        outcome = "cancelled",
+                        reason_code = "recovered",
+                        room = name,
+                        agent = t.from,
+                        candidate = t.to,
+                        "failure trial cancelled"
+                    );
+                    self.rechecks.lock().unwrap().remove(name);
+                    self.changed.notify_waiters();
                 }
                 Verdict::Healthy => {
                     let drop = self.origin_wrote_video(name, &t.from, seen, samples)?;
@@ -1046,11 +1058,41 @@ mod tests {
         assert_eq!(until("r", T + 91 * MIN), 20 * MIN, "稳定满 1 小时从头起");
     }
 
-    /// 取消（§4.5）：下播、撤销分配、换场、原机恢复、别的原因已在交接。候选机收到不含试拉的清单，不迁、不加限制。
+    /// 原机信号中途回落不取消，观察完再看：原机仍有问题就转正，已恢复才取消（线上某房间：断续的重连缺口让信号
+    /// 反复回落，试拉被连取消两次，晚了约 2 分钟才迁走）。
+    #[test]
+    fn a_trial_runs_to_the_end_even_if_the_origin_recovers_meanwhile() {
+        for still_bad in [true, false] {
+            let app = on();
+            started(&app, "b");
+            let lines = trial_logs(|| beat(&app, "a", &capable(), T + 10_000));
+            assert!(lines.is_empty(), "{lines:?}");
+            assert!(app.trial_for("b").is_some(), "信号回落后接着试");
+            if still_bad {
+                beat(&app, "a", &no_video("r"), T + 20_000);
+            }
+            let lines =
+                trial_logs(|| beat(&app, "b", &trialing("r", run(23, 6_000, 1.0)), T + 25_000));
+            let handoff = db::handoff(&app.db(), "r").unwrap();
+            if still_bad {
+                assert!(handoff.is_some(), "{lines:?}");
+            } else {
+                assert!(
+                    lines[0].contains("outcome=\"cancelled\"")
+                        && lines[0].contains("reason_code=\"recovered\""),
+                    "{lines:?}"
+                );
+                assert_eq!(handoff, None);
+                assert_eq!(app.trial_for("b"), None);
+                assert_eq!(room_limit(&app, "r", "a"), None);
+            }
+        }
+    }
+
+    /// 取消（§4.5）：下播、撤销分配、换场、别的原因已在交接。候选机收到不含试拉的清单，不迁、不加限制。
     #[test]
     fn a_trial_is_cancelled_when_the_room_or_the_origin_changes() {
-        let cancels: [Case; 5] = [
-            ("recovered", |app| beat(app, "a", &capable(), T + 10_000)),
+        let cancels: [Case; 4] = [
             ("assignment_changed", |app| {
                 db::unassign(&app.db(), "r").unwrap()
             }),
@@ -1188,8 +1230,9 @@ mod tests {
         assert_eq!(room_limit(&app, "r", "a"), None);
         assert_eq!(db::handoff(&app.db(), "r").unwrap(), None);
         assert!(db::limit(&app.db(), "a").unwrap().is_none());
-        // 原机恢复：取消进行中的试拉，递增间隔归零；再出问题立刻重新试。
+        // 原机恢复：进行中的试拉观察完就取消，递增间隔归零；再出问题立刻重新试。
         beat(&app, "a", &capable(), at + 10_000);
+        beat(&app, "c", &trialing("r", run(23, 6_000, 1.0)), at + 25_000);
         assert!(app.trials.lock().unwrap().is_empty());
         assert!(app.rechecks.lock().unwrap().is_empty());
         beat(&app, "a", &no_video("r"), at + 20_000);
@@ -1324,11 +1367,12 @@ mod tests {
         let task = started(&app, "b");
         assert_eq!(app.side_tasks("b", T).unwrap(), (None, Some(task)));
         beat(&app, "a", &capable(), T + 10_000);
+        beat(&app, "b", &trialing("r", run(23, 6_000, 1.0)), T + 25_000);
         assert_eq!(app.side_tasks("b", T).unwrap(), (Some(probe), None));
     }
 
     /// 线上场景：房间刚分到机器，连上后几十秒没有关键帧，按 `record rate 0.00` 报上来。
-    /// 开关开着时只对这个房间试拉，同机正常录制的另一个房间不动；出了画面就取消。
+    /// 开关开着时只对这个房间试拉，同机正常录制的另一个房间不动；出了画面，观察完就取消。
     #[test]
     fn a_room_without_keyframes_at_the_start_is_trialled_alone() {
         let app = on();
@@ -1354,8 +1398,9 @@ mod tests {
             assert!(!app.schedule(&db_room(&app, room), live(), T).unwrap());
             assert_eq!(db::handoff(&app.db(), room).unwrap(), None, "{room} 不迁");
         }
-        // 第一个关键帧出来，倍率恢复：取消试拉，谁也没动。
+        // 第一个关键帧出来，倍率恢复：观察完取消试拉，谁也没动。
         beat(&app, "a", &rates(1.0), T + 10_000);
+        beat(&app, "b", &trialing("r", run(23, 6_000, 1.0)), T + 25_000);
         assert_eq!(app.trial_for("b"), None);
         for room in ["r", "r2"] {
             assert_eq!(db::assignment(&app.db(), room).unwrap().unwrap().0, "a");

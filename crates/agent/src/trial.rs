@@ -64,6 +64,11 @@ impl Gate {
             inner.release(part);
         }
     }
+
+    /// 运行中总控时区更新时同步更新正式录制的时区（转正移文件时目录模板用到）。
+    pub fn set_tz_offset(&self, tz: Option<chrono::FixedOffset>) {
+        self.inner.lock().unwrap().formal.tz_offset = tz;
+    }
 }
 
 impl Inner {
@@ -117,7 +122,10 @@ impl Inner {
     /// 移到正式录制此刻会写的目录，重名时加序号。
     fn move_out(&self, from: &Path, title: &str) -> std::io::Result<PathBuf> {
         let template = file_template(&self.formal, &self.room, title);
-        let rendered = PathBuf::from(lubic::downloader::util::format_filename(&template));
+        let rendered = PathBuf::from(lubic::downloader::util::format_filename_in(
+            &template,
+            self.formal.tz_offset,
+        ));
         let dir = rendered.parent().unwrap_or(Path::new("."));
         std::fs::create_dir_all(dir)?;
         let name = from.file_name().unwrap_or_default();
@@ -181,6 +189,7 @@ mod tests {
             part_id: "p".into(),
             path: staged("a.flv.part"),
             title: String::new(),
+            tz_offset_secs: None,
         };
         let pass = |e: Event| gate.inner.lock().unwrap().pass(e);
         pass(Event::PartOpened(opened.clone()));
@@ -242,5 +251,32 @@ mod tests {
         let after = tmp.path().join("rec/r/c.flv");
         pass(Event::PartClosed(closed(after.clone())));
         assert!(matches!(rx.try_recv(), Ok(Event::PartClosed(p)) if p.path == after));
+    }
+
+    #[test]
+    fn move_out_uses_formal_tz_offset_for_dated_output_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = tmp.path().join(".trial");
+        let tz = chrono::FixedOffset::east_opt(9 * 3600).unwrap();
+        let formal = RecordConfig {
+            output: tmp.path().join("rec_%:z/{name}").display().to_string(),
+            filename: Some("x".into()),
+            tz_offset: Some(tz),
+            ..Default::default()
+        };
+        let (tx, mut rx) = unbounded_channel();
+        let gate = Gate::new(staging.clone(), formal, "r".into(), tx);
+        let staged = staging.join("r/a.flv");
+        std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+        std::fs::write(&staged, "data").unwrap();
+        gate.inner
+            .lock()
+            .unwrap()
+            .pass(Event::PartClosed(closed(staged)));
+        gate.promote(false);
+        let Ok(Event::PartClosed(p)) = rx.try_recv() else {
+            panic!()
+        };
+        assert_eq!(p.path, tmp.path().join("rec_+09:00/r/a.flv"));
     }
 }
