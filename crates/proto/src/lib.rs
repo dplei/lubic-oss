@@ -509,6 +509,47 @@ mod tests {
         );
     }
 
+    /// `PartOpened::source_url` 与 `PartClosed::source_url`：旧报文缺省为 `None` 且不改变原格式，
+    /// 新报文旧端照常读（未知字段忽略）。
+    #[test]
+    fn source_url_mixes_with_older_peers() {
+        let old_open = r#"{"seq":1,"event":{"Recorder":{"event":{"PartOpened":{"owner":{"room":"r","session":"s"},"part_id":"p","path":"/a.flv.part","title":"t"}},"at":9}}}"#;
+        let e: Envelope = serde_json::from_str(old_open).unwrap();
+        let AgentEvent::Recorder {
+            event: Event::PartOpened(mut open),
+            ..
+        } = e.event.clone()
+        else {
+            panic!()
+        };
+        assert_eq!(open.source_url, None);
+        assert_eq!(serde_json::to_string(&e).unwrap(), old_open);
+        open.source_url = Some("https://live.bilibili.com/2".into());
+        let v = serde_json::to_value(&open).unwrap();
+        assert_eq!(v["source_url"], "https://live.bilibili.com/2");
+        #[derive(Deserialize)]
+        struct OldPart {
+            part_id: String,
+        }
+        assert_eq!(serde_json::from_value::<OldPart>(v).unwrap().part_id, "p");
+
+        let old_closed = r#"{"seq":1,"event":{"Recorder":{"event":{"PartClosed":{"owner":{"room":"r","session":"s"},"part_id":"p","path":"/a.flv","duration":{"secs":5,"nanos":0},"size":1,"reason":"TimedSplit","title":"t"}},"at":9}}}"#;
+        let e: Envelope = serde_json::from_str(old_closed).unwrap();
+        let AgentEvent::Recorder {
+            event: Event::PartClosed(mut closed),
+            ..
+        } = e.event.clone()
+        else {
+            panic!()
+        };
+        assert_eq!(closed.source_url, None);
+        assert_eq!(serde_json::to_string(&e).unwrap(), old_closed);
+        closed.source_url = Some("https://live.bilibili.com/2".into());
+        let v = serde_json::to_value(&closed).unwrap();
+        assert_eq!(v["source_url"], "https://live.bilibili.com/2");
+        assert_eq!(serde_json::from_value::<OldPart>(v).unwrap().part_id, "p");
+    }
+
     #[test]
     fn drain_is_tagged_by_action() {
         let wait = Drain::Wait { reason: "x".into() };

@@ -674,6 +674,7 @@ pub struct LifecycleFile<'a> {
     close_handle: SegmentCloseHandle,
     owner: RecordingOwner,
     title: String,
+    source_url: Option<String>,
     identity: Option<SegmentIdentity>,
     opened_at: Option<Instant>,
     last_closed: Option<PartClosed>,
@@ -722,6 +723,7 @@ impl<'a> LifecycleFile<'a> {
             close_handle,
             owner: RecordingOwner::default(),
             title: String::new(),
+            source_url: None,
             identity: None,
             opened_at: None,
             last_closed: None,
@@ -772,6 +774,12 @@ impl<'a> LifecycleFile<'a> {
     /// 直播标题，原样带进 [`PartOpened`] / [`PartClosed`]。
     pub fn with_title(mut self, title: String) -> Self {
         self.title = title;
+        self
+    }
+
+    /// 实际录制的直播间地址，带进 [`PartOpened`] / [`PartClosed`]。
+    pub fn with_source_url(mut self, source_url: Option<String>) -> Self {
+        self.source_url = source_url;
         self
     }
 
@@ -833,6 +841,7 @@ impl<'a> LifecycleFile<'a> {
             path: self.path.clone(),
             title: self.title.clone(),
             tz_offset_secs: Some(used_offset.local_minus_utc()),
+            source_url: self.source_url.clone(),
         };
         segment_created(&opened, &identity);
         if let Some(hook) = &mut self.on_open {
@@ -870,6 +879,7 @@ impl<'a> LifecycleFile<'a> {
                     reason,
                     title: self.title.clone(),
                     closed_at_ms: None,
+                    source_url: self.source_url.clone(),
                 };
                 segment_closed(&event);
                 (self.hook)(&event);

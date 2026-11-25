@@ -1261,6 +1261,7 @@ mod tests {
             reason: CloseReason::TimedSplit,
             title: "t".into(),
             closed_at_ms: None,
+            source_url: None,
         })
     }
 
@@ -1272,6 +1273,7 @@ mod tests {
             path: part.clone(),
             title: "t".into(),
             tz_offset_secs: None,
+            source_url: None,
         });
         (ev, part)
     }

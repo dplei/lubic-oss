@@ -76,6 +76,9 @@ pub struct RoomView {
     pub room: db::Room,
     /// 分给了哪台机器。
     pub agent: Option<String>,
+    /// 当前分配实际在录的直播间地址（多来源时可能不是主房）；未分配为空。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_url: Option<String>,
     /// 正交接给哪台。
     pub handoff_to: Option<String>,
     /// 这一场还没下播（有分P在录或在下播宽限里）。
@@ -92,6 +95,8 @@ pub struct RoomView {
 pub struct SessionView {
     pub started_at: i64,
     pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_url: Option<String>,
     /// 各分P，按开录先后。
     pub parts: Vec<PartView>,
 }
@@ -252,8 +257,8 @@ impl App {
         let bgs = db::cover_bg_rooms(&conn)?;
         let mut out = Vec::new();
         for room in db::rooms(&conn)?.into_iter().filter(|r| !r.deleted) {
-            let session =
-                db::current_session(&conn, &room.name)?.map(|(started_at, title, parts)| {
+            let session = db::current_session(&conn, &room.name)?.map(
+                |(started_at, title, source_url, parts)| {
                     let parts = parts
                         .into_iter()
                         .map(|mut part| {
@@ -270,11 +275,14 @@ impl App {
                     SessionView {
                         started_at,
                         title,
+                        source_url,
                         parts,
                     }
-                });
+                },
+            );
             out.push(RoomView {
                 agent: db::assignment(&conn, &room.name)?.map(|(a, _)| a),
+                active_url: db::assigned_task(&conn, &room.name)?.map(|(_, t)| t.url),
                 handoff_to: db::handoff(&conn, &room.name)?.map(|h| h.to),
                 recording: session.is_some(),
                 session,
@@ -296,7 +304,18 @@ impl App {
     /// 新建（`create`）或整行替换。改动不碰正在录的这一场：它用分配时的参数快照。
     pub fn save_room(&self, mut room: db::Room, create: bool) -> Result<()> {
         room.name = room.name.trim().to_string();
-        room.url = room.url.trim().to_string();
+        let raw_urls = if !room.urls.is_empty() {
+            room.urls
+        } else if !room.url.trim().is_empty() {
+            vec![room.url]
+        } else {
+            Vec::new()
+        };
+        let urls: Vec<String> = raw_urls
+            .into_iter()
+            .map(|u| u.trim().to_string())
+            .filter(|u| !u.is_empty())
+            .collect();
         // 显示名去掉首尾空白，空的就当没填（回退房间名）。
         room.display_name = room
             .display_name
@@ -313,9 +332,28 @@ impl App {
         {
             return bad("房间名不能为空，也不能含 / \\ 或控制字符");
         }
-        if !builtin_plugins().iter().any(|p| p.matches(&room.url)) {
-            return bad(format!("不认识的直播间地址：{}", room.url));
+        if urls.is_empty() {
+            return bad("至少填一个直播间地址");
         }
+        let plugins = builtin_plugins();
+        let mut platform: Option<&'static str> = None;
+        for (i, u) in urls.iter().enumerate() {
+            let Some(plugin) = plugins.iter().find(|p| p.matches(u)) else {
+                return bad(format!("不认识的直播间地址：{u}"));
+            };
+            if let Some(first) = platform {
+                if plugin.name() != first {
+                    return bad("同一个房间的直播间地址必须是同一平台");
+                }
+            } else {
+                platform = Some(plugin.name());
+            }
+            if urls[..i].contains(u) {
+                return bad(format!("直播间地址重复：{u}"));
+            }
+        }
+        room.url = urls[0].clone();
+        room.urls = urls;
         if let Some(q) = &room.douyin_quality
             && !["origin", "uhd", "hd", "sd", "ld", "md"].contains(&q.as_str())
         {
@@ -795,6 +833,7 @@ impl App {
         db::delete_machine(&tx, name)?;
         tx.commit()?;
         drop(conn);
+        self.agent_rooms.lock().unwrap().remove(name);
         self.changed.notify_waiters();
         if force {
             info!(machine = name, "machine force-removed");
@@ -2783,6 +2822,145 @@ mod tests {
         assert_eq!(
             (v.pending[0].archive.id, v.pending[0].state, v.pending[0].at),
             (2, "probe", Some(pause_until))
+        );
+    }
+
+    #[tokio::test]
+    async fn room_multi_source_validation_ordering_and_single_url_compat() {
+        let (base, app, _) = serve().await;
+        let mut c = Client {
+            base,
+            http: reqwest::Client::new(),
+            cookie: None,
+        };
+        c.login("pw").await;
+
+        // 1) 单地址旧请求兼容：只传 url，保存后 url 与 urls 都一致。
+        let single = json!({
+            "name": "single",
+            "url": "https://live.bilibili.com/101",
+            "template_id": 1,
+            "agents": ["a"],
+        });
+        assert_eq!(
+            c.call(Method::POST, "/api/rooms", Some(single)).await.0,
+            StatusCode::CREATED
+        );
+        let (_, got) = c.call(Method::GET, "/api/rooms/single", None).await;
+        assert_eq!(got["url"], "https://live.bilibili.com/101");
+        assert_eq!(got["urls"], json!(["https://live.bilibili.com/101"]));
+
+        // 2) 多地址同平台：支持新增、调整顺序、删减，第一项始终为主房（url == urls[0]）。
+        let multi = json!({
+            "name": "multi",
+            "urls": [
+                " https://live.bilibili.com/201 ",
+                "https://live.bilibili.com/202",
+                "https://live.bilibili.com/203"
+            ],
+            "template_id": 1,
+            "agents": ["a"],
+        });
+        assert_eq!(
+            c.call(Method::POST, "/api/rooms", Some(multi)).await.0,
+            StatusCode::CREATED
+        );
+        let (_, got) = c.call(Method::GET, "/api/rooms/multi", None).await;
+        assert_eq!(got["url"], "https://live.bilibili.com/201");
+        assert_eq!(
+            got["urls"],
+            json!([
+                "https://live.bilibili.com/201",
+                "https://live.bilibili.com/202",
+                "https://live.bilibili.com/203"
+            ])
+        );
+
+        let reordered = json!({
+            "name": "multi",
+            "url": "https://live.bilibili.com/201",
+            "urls": [
+                "https://live.bilibili.com/202",
+                "https://live.bilibili.com/201"
+            ],
+            "template_id": 1,
+            "agents": ["a"],
+        });
+        assert_eq!(
+            c.call(Method::PUT, "/api/rooms/multi", Some(reordered))
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
+        let (_, got) = c.call(Method::GET, "/api/rooms/multi", None).await;
+        assert_eq!(got["url"], "https://live.bilibili.com/202");
+        assert_eq!(
+            got["urls"],
+            json!([
+                "https://live.bilibili.com/202",
+                "https://live.bilibili.com/201"
+            ])
+        );
+
+        // 3) 校验：空地址、跨平台、重复地址、不认识的地址均被拒。
+        for (urls, want) in [
+            (json!([]), "至少填一个"),
+            (json!(["  ", ""]), "至少填一个"),
+            (
+                json!([
+                    "https://live.bilibili.com/301",
+                    "https://live.douyin.com/302"
+                ]),
+                "同一平台",
+            ),
+            (
+                json!([
+                    "https://live.bilibili.com/301",
+                    "https://live.bilibili.com/301"
+                ]),
+                "重复",
+            ),
+            (
+                json!(["https://live.bilibili.com/301", "https://example.com/302"]),
+                "不认识的直播间地址",
+            ),
+        ] {
+            let body = json!({
+                "name": "bad_multi",
+                "urls": urls,
+                "template_id": 1,
+                "agents": ["a"],
+            });
+            let (code, v) = c.call(Method::POST, "/api/rooms", Some(body)).await;
+            assert_eq!(code, StatusCode::BAD_REQUEST, "{v}");
+            assert!(v["error"].as_str().unwrap().contains(want), "{v}");
+        }
+
+        // 4) RoomView 暴露当前实际在录来源 active_url。
+        let r = db_room(&app, "multi");
+        let backup_task = r.task_for("https://live.bilibili.com/201");
+        db::assign(&app.db(), "multi", "a", "s1", now_ms(), &backup_task).unwrap();
+        let mut first = db::tests::opened("multi-first", "s1", now_ms());
+        if let lubic_proto::AgentEvent::Recorder {
+            event: lubic_events::Event::PartOpened(p),
+            ..
+        } = &mut first
+        {
+            p.owner.room = "multi".into();
+            p.source_url = Some("https://live.bilibili.com/202".into());
+        }
+        db::apply(&app.db(), "a", &first).unwrap();
+        let (_, list) = c.call(Method::GET, "/api/rooms", None).await;
+        let view = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x["name"] == "multi")
+            .unwrap();
+        assert_eq!(view["active_url"], "https://live.bilibili.com/201");
+        assert_eq!(
+            view["session"]["source_url"],
+            "https://live.bilibili.com/202"
         );
     }
 }

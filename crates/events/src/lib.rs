@@ -27,6 +27,10 @@ pub struct PartOpened {
     /// 旧 agent 不报时为 `None`，总控投稿时按配置时区兜底重渲染分P标题。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tz_offset_secs: Option<i32>,
+    /// 录这一段时实际使用的直播间地址（多来源房间用于固定稿件的 `{url}`）。
+    /// 旧 agent 不报时为 `None`，总控回退到分配快照或主房地址。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_url: Option<String>,
 }
 
 /// 分段已收尾，`path` 是改名后的最终文件，可以上传了。
@@ -45,6 +49,9 @@ pub struct PartClosed {
     /// agent 拿它当事件的 `at`，总控按 `at − duration` 推出的开录时刻与排序才对；平常为 `None`，按收到的时刻。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closed_at_ms: Option<i64>,
+    /// 同 [`PartOpened::source_url`]；故障试拉转正只补 `PartClosed` 时也带上它。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_url: Option<String>,
 }
 
 /// 录制侧发给 agent 的事件。
