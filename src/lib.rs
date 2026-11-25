@@ -4,11 +4,13 @@
 //! - [`downloader::httpflv`] / [`downloader::hls`]：拉流、修时间戳、按规则切段写盘。
 //! - [`recorder`]：轮询 → 录制 → 断流重连 → 下播宽限，串起上面两层。
 //! - [`danmaku`]：跟着分段事件按分P录 B 站 / 抖音弹幕（XML）。
+//! - [`edge_probe`]：拉流出问题时对照几个公共 DNS 会落到的边缘节点，只打日志。
 //! - [`logging`]：总控与 agent 共用的日志初始化（stdout + 可选的按天文件）。
 
 pub mod client;
 pub mod danmaku;
 pub mod downloader;
+pub mod edge_probe;
 pub mod logging;
 pub mod recorder;
 

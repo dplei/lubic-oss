@@ -130,6 +130,9 @@ pub struct FlvProgress {
     pub video_frames: u64,
     pub valid_video: bool,
     pub gap_reported: bool,
+    pub(crate) edge_switched: bool,
+    pub(crate) edge_attempt: Option<EdgeAttempt>,
+    pub(crate) connection_diagnostics: Option<ConnectionDiagnostics>,
     /// 无法精确计量（例如磁盘写失败）时为 None。
     pub discarded_tail_tags: Option<u64>,
     pub discarded_tail_bytes: Option<u64>,
@@ -139,7 +142,23 @@ pub struct FlvProgress {
     pub(crate) pending_quality_upgrade: Option<PendingQualityUpgrade>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct EdgeAttempt {
+    pub id: String,
+    pub previous_edge: Option<std::net::IpAddr>,
+    pub previous_ended: Instant,
+    pub first_video_wall_ms: Option<u64>,
+}
+
 impl FlvProgress {
+    fn note_reconnect_video(&mut self) {
+        if let Some(attempt) = &mut self.edge_attempt {
+            attempt
+                .first_video_wall_ms
+                .get_or_insert_with(|| attempt.previous_ended.elapsed().as_millis() as u64);
+        }
+    }
+
     pub(crate) fn report_reconnect(
         &mut self,
         owner: &crate::downloader::util::RecordingOwner,
@@ -177,6 +196,9 @@ impl FlvProgress {
             outcome = if bounds.is_some() { "measured" } else { "unknown" },
             reason_code,
             gap_ms, overlap_ms,
+            edge_switched = self.edge_switched,
+            edge_attempt_id = self.edge_attempt.as_ref().map(|attempt| attempt.id.as_str()),
+            first_video_wall_ms = self.edge_attempt.as_ref().and_then(|attempt| attempt.first_video_wall_ms),
             previous_live_ms = self.previous_live_ms.unwrap_or(-1),
             first_live_ms = self.first_live_ms.unwrap_or(-1),
             room = owner.room.as_str(), session = owner.session.as_str(),
@@ -543,6 +565,8 @@ fn emit_disconnected(
             duration_ms,
             received_bytes = diagnostics.received_bytes,
             edge,
+            edge_switched = progress.edge_switched,
+            edge_attempt_id = progress.edge_attempt.as_ref().map(|attempt| attempt.id.as_str()),
             splits = progress.splits,
             first_timestamp_ms = optional_ms(progress.first_timestamp_ms),
             last_timestamp_ms = optional_ms(progress.last_timestamp_ms),
@@ -576,6 +600,8 @@ fn emit_disconnected(
         http_status = diagnostics.http_status,
         received_bytes = diagnostics.received_bytes,
         edge,
+        edge_switched = progress.edge_switched,
+        edge_attempt_id = progress.edge_attempt.as_ref().map(|attempt| attempt.id.as_str()),
         buffered = diagnostics.buffered,
         stall_timeout_secs = diagnostics.stall_timeout.as_secs(),
         splits = progress.splits,
@@ -635,6 +661,7 @@ impl FlvWriteState {
         owner: &crate::downloader::util::RecordingOwner,
         pace: Option<&Pace>,
     ) {
+        progress.note_reconnect_video();
         // 无 SEI 的换基准不能沿用旧 offset，宁可报告未知，也不捏造跨连接缺口。
         if self
             .last_video_ms
@@ -871,15 +898,39 @@ pub(crate) async fn probe_candidate(
     url: &str,
     stall_timeout: Duration,
 ) -> crate::downloader::error::Result<Connection> {
-    timeout(CANDIDATE_PROBE_TIMEOUT, async {
+    probe_candidate_with_diagnostics(client, url, stall_timeout, &mut CandidateProbe::default())
+        .await
+}
+
+#[derive(Default)]
+pub(crate) struct CandidateProbe {
+    pub stage: &'static str,
+    pub edge: Option<std::net::IpAddr>,
+    pub http_status: Option<u16>,
+    pub budget_exhausted: bool,
+}
+
+pub(crate) async fn probe_candidate_with_diagnostics(
+    client: &crate::client::StatelessClient,
+    url: &str,
+    stall_timeout: Duration,
+    probe: &mut CandidateProbe,
+) -> crate::downloader::error::Result<Connection> {
+    probe.stage = "http";
+    let result = timeout(CANDIDATE_PROBE_TIMEOUT, async {
         let response = client
             .client
             .get(url)
             .headers(client.headers.clone())
             .send()
             .await
-            .and_then(reqwest::Response::error_for_status)
             .map_err(|e| crate::downloader::error::Error::Custom(e.without_url().to_string()))?;
+        probe.edge = response.remote_addr().map(|addr| addr.ip());
+        probe.http_status = Some(response.status().as_u16());
+        let response = response
+            .error_for_status()
+            .map_err(|e| crate::downloader::error::Error::Custom(e.without_url().to_string()))?;
+        probe.stage = "flv_header";
         let mut connection = Connection::with_stall_timeout(response, stall_timeout);
         let head = connection.read_frame(9).await?;
         if crate::downloader::flv_parser::header(&head).is_err() {
@@ -893,6 +944,7 @@ pub(crate) async fn probe_candidate(
                 buffered: previous_tag_size_0.len(),
             });
         }
+        probe.stage = "keyframe";
         let mut prefix = BytesMut::with_capacity(4096);
         prefix.extend_from_slice(&previous_tag_size_0);
         let mut has_avc_config = false;
@@ -919,8 +971,9 @@ pub(crate) async fn probe_candidate(
             }
         }
     })
-    .await
-    .map_err(|_| {
+    .await;
+    result.map_err(|_| {
+        probe.budget_exhausted = true;
         crate::downloader::error::Error::Custom("candidate FLV probe timed out".to_string())
     })?
 }
@@ -1378,6 +1431,10 @@ impl Connection {
 
     pub(crate) fn set_pace(&mut self, pace: Option<std::sync::Arc<crate::downloader::util::Pace>>) {
         self.pace = pace;
+    }
+
+    pub(crate) fn started_at(&self) -> Instant {
+        self.started_at
     }
 
     pub(crate) fn prepend_replay(&mut self, prefix: &[u8]) {
@@ -1882,10 +1939,16 @@ mod tests {
             let mut progress = super::FlvProgress {
                 reconnecting: true,
                 previous_live_ms: previous,
+                edge_attempt: Some(super::EdgeAttempt {
+                    id: "test-attempt".to_string(),
+                    previous_edge: None,
+                    previous_ended: std::time::Instant::now(),
+                    first_video_wall_ms: None,
+                }),
                 ..Default::default()
             };
             let pace = std::sync::Arc::new(crate::downloader::util::Pace::default());
-            super::parse_flv(
+            super::download_with_progress(
                 &mut connection,
                 LifecycleFile::new(&template, "flv"),
                 crate::downloader::util::Segmentable::default().with_pace(Some(pace.clone())),
@@ -1907,6 +1970,13 @@ mod tests {
             assert_eq!(gaps.len(), 1);
             assert_eq!(gaps[0]["gap_ms"], expected_gap);
             assert_eq!(gaps[0]["overlap_ms"], expected_overlap);
+            let disconnected = events
+                .iter()
+                .find(|event| event["event_name"] == "recording.disconnected")
+                .unwrap();
+            assert_eq!(gaps[0]["edge_attempt_id"], "test-attempt");
+            assert_eq!(disconnected["edge_attempt_id"], gaps[0]["edge_attempt_id"]);
+            assert!(gaps[0]["first_video_wall_ms"].parse::<u64>().is_ok());
         }
     }
 
@@ -3095,11 +3165,21 @@ mod tests {
 
         // 1. 坏 FLV 头
         let bad_url = serve_once(b"NOT_FLV_DATA".to_vec(), false).await;
+        let mut probe = super::CandidateProbe::default();
         assert!(
-            super::probe_candidate(&client, &bad_url, Duration::from_secs(5))
-                .await
-                .is_err()
+            super::probe_candidate_with_diagnostics(
+                &client,
+                &bad_url,
+                Duration::from_secs(5),
+                &mut probe
+            )
+            .await
+            .is_err()
         );
+        assert_eq!(probe.stage, "flv_header");
+        assert_eq!(probe.edge, Some(std::net::Ipv4Addr::LOCALHOST.into()));
+        assert_eq!(probe.http_status, Some(200));
+        assert!(!probe.budget_exhausted);
 
         // 2. 只有序列头和音频，无关键帧就 EOF
         let mut audio_only = vec![b'F', b'L', b'V', 1, 5, 0, 0, 0, 9, 0, 0, 0, 0];
@@ -3166,11 +3246,20 @@ mod tests {
         // 4. 超过 8 秒超时
         let stall_url =
             serve_once(vec![b'F', b'L', b'V', 1, 5, 0, 0, 0, 9, 0, 0, 0, 0], true).await;
+        let mut probe = super::CandidateProbe::default();
         assert!(
-            super::probe_candidate(&client, &stall_url, Duration::from_secs(30))
-                .await
-                .is_err()
+            super::probe_candidate_with_diagnostics(
+                &client,
+                &stall_url,
+                Duration::from_secs(30),
+                &mut probe
+            )
+            .await
+            .is_err()
         );
+        assert_eq!(probe.stage, "keyframe");
+        assert_eq!(probe.edge, Some(std::net::Ipv4Addr::LOCALHOST.into()));
+        assert!(probe.budget_exhausted);
     }
 
     #[test]

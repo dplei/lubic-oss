@@ -258,7 +258,11 @@ impl Pace {
     }
 
     pub fn mark_connected(&self) {
-        self.0.lock().unwrap().connected_at = Some(Instant::now());
+        self.mark_connected_at(Instant::now());
+    }
+
+    pub(crate) fn mark_connected_at(&self, at: Instant) {
+        self.0.lock().unwrap().connected_at = Some(at);
     }
 
     pub fn take_connected(&self) -> Option<Instant> {

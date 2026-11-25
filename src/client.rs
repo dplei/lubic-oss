@@ -12,16 +12,25 @@ pub struct StatelessClient {
 
 impl StatelessClient {
     pub fn new(headers: HeaderMap) -> Self {
-        let client = reqwest::Client::builder()
+        Self::with_resolution(headers, None).expect("static client config is valid")
+    }
+
+    pub(crate) fn with_resolution(
+        headers: HeaderMap,
+        resolution: Option<(&str, std::net::SocketAddr)>,
+    ) -> reqwest::Result<Self> {
+        let builder = reqwest::Client::builder()
             .user_agent("Mozilla/5.0 (X11; Linux x86_64; rv:60.1) Gecko/20100101 Firefox/60.1")
             .default_headers(headers)
-            .connect_timeout(Duration::from_secs(60))
-            .build()
-            .expect("static client config is valid");
-        Self {
-            client,
+            .connect_timeout(Duration::from_secs(60));
+        let builder = match resolution {
+            Some((host, addr)) => builder.resolve(host, addr),
+            None => builder,
+        };
+        Ok(Self {
+            client: builder.build()?,
             headers: HeaderMap::new(),
-        }
+        })
     }
 
     /// GET 并重试瞬时失败；非 2xx 也算失败。
