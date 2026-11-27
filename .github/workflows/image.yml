@@ -5,9 +5,16 @@ name: image
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - 'docs/**'
-      - '**/*.md'
+    paths:
+      - 'src/**'
+      - 'crates/**'
+      - 'tests/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'Dockerfile'
+      - '.dockerignore'
+      - '.github/workflows/image.yml'
+      - '!crates/controller/src/demo.rs'
   workflow_dispatch:
 
 permissions:
