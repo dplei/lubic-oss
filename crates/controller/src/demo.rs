@@ -22,6 +22,7 @@ fn part_event(
     at: i64,
     close: bool,
     title: &str,
+    source_url: Option<&str>,
 ) -> AgentEvent {
     let owner = Owner {
         room: room.into(),
@@ -37,7 +38,7 @@ fn part_event(
             reason: CloseReason::TimedSplit,
             title: title.into(),
             closed_at_ms: None,
-            source_url: None,
+            source_url: source_url.map(Into::into),
         })
     } else {
         Event::PartOpened(PartOpened {
@@ -46,7 +47,7 @@ fn part_event(
             path: format!("/rec/{part}.flv.part").into(),
             title: title.into(),
             tz_offset_secs: Some(8 * 3600),
-            source_url: None,
+            source_url: source_url.map(Into::into),
         })
     };
     AgentEvent::Recorder { event, at }
@@ -84,14 +85,15 @@ fn session(
     uploaded_n: usize,
     live: bool,
     title: &str,
+    source_url: Option<&str>,
 ) {
     let mut events = Vec::new();
     for i in 0..parts {
         let id = format!("{key}-{i}");
         let at = start + i as i64 * HOUR;
-        events.push(part_event(room, key, &id, at, false, title));
+        events.push(part_event(room, key, &id, at, false, title, source_url));
         if !(live && i + 1 == parts) {
-            events.push(part_event(room, key, &id, at + HOUR, true, title));
+            events.push(part_event(room, key, &id, at + HOUR, true, title, source_url));
         }
         if i < uploaded_n {
             events.push(uploaded(&id));
@@ -129,30 +131,36 @@ fn seed(app: &App, now: i64) {
         )
         .unwrap();
     }
-    for (name, url, agents, split) in [
+    for (name, urls, agents, split) in [
         (
             "阿橘",
-            "https://live.bilibili.com/10000001",
+            &[
+                "https://live.bilibili.com/10000001",
+                "https://live.bilibili.com/10000011",
+            ][..],
             &["cloud-a", "cloud-b", "home"][..],
             3600,
         ),
         (
             "小满",
-            "https://live.douyin.com/10000002",
+            &[
+                "https://live.douyin.com/10000002",
+                "https://live.douyin.com/10000022",
+            ][..],
             &["home", "cloud-a"][..],
             3600,
         ),
         (
             "夜航",
-            "https://live.bilibili.com/10000003",
+            &["https://live.bilibili.com/10000003"][..],
             &["cloud-b", "cloud-a"][..],
             1800,
         ),
     ] {
         let room = db::Room {
             name: name.into(),
-            url: url.into(),
-            urls: vec![url.into()],
+            url: urls[0].into(),
+            urls: urls.iter().map(|u| (*u).into()).collect(),
             template_id: 1,
             agents: agents.iter().map(|a| a.to_string()).collect(),
             split_time: Some(split),
@@ -182,6 +190,7 @@ fn seed(app: &App, now: i64) {
         2,
         false,
         "通宵马拉松",
+        None,
     );
     db::submitted(
         &app.db(),
@@ -203,6 +212,7 @@ fn seed(app: &App, now: i64) {
         3,
         false,
         "冲分",
+        None,
     );
     session(
         app,
@@ -214,8 +224,9 @@ fn seed(app: &App, now: i64) {
         3,
         false,
         "周末联机",
+        None,
     );
-    // 阿橘：在 cloud-a 上录第 3 个分P，第 2 个在传。
+    // 阿橘：在 cloud-a 上用主房录第 3 个分P，第 2 个在传。
     session(
         app,
         "cloud-a",
@@ -226,9 +237,11 @@ fn seed(app: &App, now: i64) {
         1,
         true,
         "今天也是排位日",
+        Some("https://live.bilibili.com/10000001"),
     );
     crate::tests::assign(app, "阿橘", "cloud-a", now - 2 * HOUR - 20 * MIN);
-    // 小满：家庭宽带机在让出网络，兜底录在 cloud-a 上。
+    // 小满：家庭宽带机在让出网络，兜底录在 cloud-a 上，且当前使用的是备用直播间。
+    let xm_backup = "https://live.douyin.com/10000022";
     session(
         app,
         "cloud-a",
@@ -239,8 +252,18 @@ fn seed(app: &App, now: i64) {
         0,
         true,
         "深夜杂谈",
+        Some(xm_backup),
     );
-    crate::tests::assign(app, "小满", "cloud-a", now - 40 * MIN);
+    let xm_room = db::room(&app.db(), "小满").unwrap().unwrap();
+    db::assign(
+        &app.db(),
+        "小满",
+        "cloud-a",
+        "s-xm",
+        now - 40 * MIN,
+        &xm_room.task_for(xm_backup),
+    )
+    .unwrap();
 
     let a = Status {
         disk_usage: 0.42,
